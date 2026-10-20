@@ -201,12 +201,45 @@ rejects! {
     rejects_a_zero_hidden_size:
         json!({ "hidden_size": 0 })
         => Qwen4ExpConfigError::Zero { field: "hidden_size" };
-    rejects_a_zero_bit_quantization_override:
-        json!({ "quantization": { "group_size": 64, "bits": 4, "model.layers.0.mlp.switch_mlp.up_proj": { "group_size": 64, "bits": 0 } } })
-        => Qwen4ExpConfigError::Quantization {
-            module: "model.layers.0.mlp.switch_mlp.up_proj".to_string(),
-            group_size: 64,
-            bits: 0,
-            reason: mlxcel_core::layers::validate_quantization_params(64, 0).unwrap_err(),
-        };
+}
+
+/// A pair reaches `gather_qmm` / `quantized_matmul` either as the default the
+/// text config inherits from the top-level block or as one module's override.
+#[test]
+fn hostile_quantization_pairs_are_refused_as_default_and_as_override() {
+    use crate::models::switch_layers::HOSTILE_QUANT_PARAMS;
+
+    let mut text = released();
+    text.as_object_mut()
+        .expect("released config is an object")
+        .remove("quantization");
+    let full = |quantization: Value| json!({ "text_config": text, "quantization": quantization });
+    text_config_from_full(&full(json!({ "group_size": 64, "bits": 4 })))
+        .expect("an honest inherited quantization block resolves");
+
+    for (group_size, bits, field) in HOSTILE_QUANT_PARAMS {
+        for (module, quantization) in [
+            (
+                "<default>",
+                json!({ "group_size": group_size, "bits": bits }),
+            ),
+            (
+                "model.layers.0.mlp.switch_mlp.up_proj",
+                json!({
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.0.mlp.switch_mlp.up_proj": { "group_size": group_size, "bits": bits }
+                }),
+            ),
+        ] {
+            let error = text_config_from_full(&full(quantization)).expect_err(&format!(
+                "{module} (group_size {group_size}, bits {bits}) must be refused"
+            ));
+            assert!(
+                error.contains(&format!("quantization.{module} declares"))
+                    && error.contains(&format!("quantization.{field} (")),
+                "{module} (group_size {group_size}, bits {bits}) must be blamed on {field}: {error}"
+            );
+        }
+    }
 }
