@@ -501,7 +501,7 @@ impl QwenVlRuntime for vision::Qwen35VLModel {
 /// expanded) returns `None` so we never double-expand.
 ///
 /// Used by: `multimodal::vlm_runtime` (Qwen2VL, Qwen2.5VL, Qwen3VL, Qwen3VLMoe,
-/// Qwen3.5VL image prompt preparation).
+/// Qwen3.5VL, Qwen3.8-Flash-Next image prompt preparation).
 /// Qwen3-Omni variant of [`insert_qwen_vl_image_tokens`]: same per-image
 /// expansion when placeholders are present, but the no-placeholder fallback
 /// splices the framed runs right BEFORE the last `im_end_token_id` (the close

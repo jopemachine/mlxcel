@@ -274,7 +274,7 @@ pub(super) fn require_object_mut<'a>(
 /// `if let Some(transform) = transform` arm exactly as before.
 ///
 /// Used by: all VLM family loaders in src/loading/vlm_*.rs
-/// (gemma, llava, nemotron_h_nano_omni, pixtral, qwen, siglip,
+/// (gemma, llava, nemotron_h_nano_omni, pixtral, qwen, qwen4_exp, siglip,
 /// special, youtu_vl)
 pub(crate) fn load_vlm_weights_common(
     model_path: &Path,

@@ -17,7 +17,7 @@
 //! This module provides the core gated delta net primitives used by models
 //! that employ hybrid transformer + linear attention architectures.
 //!
-//! Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+//! Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 //!
 //! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gated_delta.py
 
@@ -51,7 +51,7 @@ const GATED_DELTA_CHUNK_SIZE: usize = 64;
 /// Cache for GatedDeltaNet (linear attention) layers.
 /// Stores conv1d state and recurrent SSM state.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear
 pub struct GatedDeltaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>, // [batch, kernel-1, conv_dim]
     pub state_cache: Option<UniquePtr<MlxArray>>, // [batch, num_v_heads, head_v_dim, head_k_dim]
@@ -115,7 +115,7 @@ impl Default for GatedDeltaCache {
 /// so the ops-path state accumulation stays in higher precision (the Python
 /// Metal kernel path uses float32 state internally for the same reason).
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3 (through
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3 (through
 /// [`compute_g_lower_bounded`] with `lower_bound = None`)
 pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePtr<MlxArray> {
     let a_plus_dt = mlxcel_core::add(a, dt_bias);
@@ -175,7 +175,7 @@ pub fn compute_g_lower_bounded(
 ///
 /// Returns: (y: [B, H, Dv] in q dtype, new_state: [B, H, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 pub fn gated_delta_step(
     q: &MlxArray,
     k: &MlxArray,
@@ -266,7 +266,7 @@ pub fn gated_delta_step(
 ///
 /// Returns: (y: [B, T, Hv, Dv] in q dtype, state: [B, Hv, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 pub fn gated_delta_ops(
     q: &MlxArray,
     k: &MlxArray,
@@ -542,7 +542,7 @@ fn gated_delta_ops_with_parity(
 /// `Ainv = (I + T)^{-1}` is formed by the finite Neumann series (T is nilpotent).
 /// All decay ratios are kept in the log domain and clamped so no entry overflows.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked(
     q_ref: &MlxArray,
@@ -738,7 +738,7 @@ fn gated_delta_chunked(
 /// lane, so `Dk` must cover at least one full SIMD group and be exactly
 /// divisible by 32. Its GQA mapping also requires an integral `Hv / Hk`.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3, `speculative_burst::mtp_capable_target`
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3, `speculative_burst::mtp_capable_target`
 /// (the Qwen 3.5 MTP capability gate, issue #1165 hardening)
 pub(crate) fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i32) -> bool {
     hk > 0 && hv > 0 && dv > 0 && dk >= 32 && dk % 32 == 0 && hv >= hk && hv % hk == 0
@@ -749,7 +749,7 @@ pub(crate) fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i
 /// Computes beta = sigmoid(b) and g = exp(-exp(A_log.float32) * softplus(a + dt_bias)),
 /// then runs the ops-based implementation with float32 state accumulation.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear
 pub fn gated_delta_update(
     q: &MlxArray,
     k: &MlxArray,
