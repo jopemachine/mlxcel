@@ -6,7 +6,7 @@ fixtures pin mlxcel's `src/models/qwen4_exp` port against mlx-vlm's
 `mlx_vlm/models/qwen4_exp` running the same tiny weights.
 
 No weight is stored. Every weight and every input tensor is generated from
-its name by a counter hash that `src/models/qwen4_exp/parity_tests.rs`
+its name by a counter hash that `src/models/qwen4_exp_parity_tests.rs`
 reimplements bit for bit (`hashed_tensor` below), so each JSON file records
 only the config, the tensor names with their shapes and scales, and the
 upstream outputs. All tensors are float32, so the comparison measures the

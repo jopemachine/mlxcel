@@ -18,8 +18,8 @@
 //! tokens and keeps the top `budget / compress_ratio` blocks per query; the
 //! query then attends to those blocks plus the incomplete block it sits in.
 //! While a query sees at most `budget / compress_ratio` complete blocks the
-//! selection covers its whole causal prefix, so attention is dense until the
-//! context passes `budget` tokens.
+//! selection covers its whole causal prefix, so attention stays dense until a
+//! query's prefix reaches `budget + compress_ratio` tokens.
 //!
 //! This is the graph form of upstream's `dispatch_qsa_attention`: the
 //! selection becomes a boolean mask for SDPA rather than an indexed Metal
