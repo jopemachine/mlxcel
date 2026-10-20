@@ -255,7 +255,7 @@ impl ShardedEmbedding {
             let shard = self.offsets.partition_point(|&offset| offset <= id) - 1;
             per_shard[shard].push((position, (id - self.offsets[shard]) as i32));
         }
-        let mut gathered: Option<UniquePtr<MlxArray>> = None;
+        let mut parts: Vec<UniquePtr<MlxArray>> = Vec::new();
         let mut source_row = vec![0i32; ids.len()];
         let mut next_row = 0i32;
         for (shard, entries) in self.shards.iter().zip(&per_shard) {
@@ -267,13 +267,10 @@ impl ShardedEmbedding {
                 source_row[position] = next_row;
                 next_row += 1;
             }
-            let rows = shard.forward(&mlxcel_core::from_slice_i32(&local, &[local.len() as i32]));
-            gathered = Some(match gathered {
-                None => rows,
-                Some(previous) => concatenate(&previous, &rows, 0),
-            });
+            parts.push(shard.forward(&mlxcel_core::from_slice_i32(&local, &[local.len() as i32])));
         }
-        let gathered = gathered.expect("lookup needs at least one id");
+        let parts: Vec<&MlxArray> = parts.iter().map(|part| &**part).collect();
+        let gathered = mlxcel_core::concatenate_many(&parts, 0);
         let order = mlxcel_core::from_slice_i32(&source_row, &[source_row.len() as i32]);
         mlxcel_core::take(&gathered, &order, 0)
     }
@@ -311,12 +308,6 @@ impl PleLayer {
     ) -> Result<Self, String> {
         let raw = &config.raw;
         let hasher = NgramHasher::new(config, ple_layer_index)?;
-        if (hasher.head_offsets.last().copied().unwrap_or(0)
-            + hasher.head_vocab_sizes.last().copied().unwrap_or(0)) as u64
-            > hasher.padded_vocab_size
-        {
-            return Err("Qwen4-Exp n-gram head vocabularies exceed the padded table".to_string());
-        }
         let row_width = config.ple_embed_dim / hasher.ngram_heads();
         let table = ShardedEmbedding::from_weights(
             weights,
