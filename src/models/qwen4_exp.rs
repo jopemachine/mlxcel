@@ -657,3 +657,7 @@ impl LanguageModel for Qwen4ExpModel {
 #[cfg(test)]
 #[path = "qwen4_exp_parity_tests.rs"]
 mod parity_tests;
+
+#[cfg(test)]
+#[path = "qwen4_exp_load_tests.rs"]
+mod load_tests;

@@ -34,7 +34,7 @@ use crate::models::gated_delta::GatedDeltaCache;
 use crate::models::qwen3_vl::InterleavedMRoPE;
 use mlxcel_core::generate::LanguageModel;
 
-fn fixture(name: &str) -> Value {
+pub(super) fn fixture(name: &str) -> Value {
     let path = format!(
         "{}/tests/fixtures/qwen4_exp/{name}.json",
         env!("CARGO_MANIFEST_DIR")
@@ -50,7 +50,7 @@ fn fnv1a64(name: &str) -> u64 {
 }
 
 /// `generate_fixtures.hashed_tensor`, element for element.
-fn hashed(name: &str, shape: &[i32], scale: f64, offset: f64) -> UniquePtr<MlxArray> {
+pub(super) fn hashed(name: &str, shape: &[i32], scale: f64, offset: f64) -> UniquePtr<MlxArray> {
     let count: i64 = shape.iter().map(|&d| i64::from(d)).product();
     let seed = fnv1a64(name);
     let (scale, offset) = (scale as f32, offset as f32);
@@ -67,7 +67,7 @@ fn hashed(name: &str, shape: &[i32], scale: f64, offset: f64) -> UniquePtr<MlxAr
     mlxcel_core::from_slice_f32(&values, shape)
 }
 
-fn shape_of(value: &Value) -> Vec<i32> {
+pub(super) fn shape_of(value: &Value) -> Vec<i32> {
     value
         .as_array()
         .expect("shape")
@@ -85,7 +85,7 @@ fn hashed_input(spec: &Value) -> UniquePtr<MlxArray> {
     )
 }
 
-fn weights(fixture: &Value) -> WeightMap {
+pub(super) fn weights(fixture: &Value) -> WeightMap {
     let mut map = WeightMap::new();
     for spec in fixture["tensors"].as_array().expect("tensors") {
         let name = spec["name"].as_str().expect("name");
@@ -100,7 +100,7 @@ fn weights(fixture: &Value) -> WeightMap {
     map
 }
 
-fn config(fixture: &Value, overrides: Option<&Value>) -> ResolvedQwen4ExpConfig {
+pub(super) fn config(fixture: &Value, overrides: Option<&Value>) -> ResolvedQwen4ExpConfig {
     let mut raw = fixture["tiny_config"].clone();
     if let Some(overrides) = overrides.and_then(Value::as_object) {
         for (key, value) in overrides {
@@ -269,7 +269,7 @@ fn gated_residual_matches_upstream_for_one_layer() {
 fn ple_ngram_ids_match_upstream_across_eos_tokens() {
     let fixture = fixture("ple");
     let config = config(&fixture, None);
-    let hasher = NgramHasher::new(&config, 0).unwrap();
+    let hasher = NgramHasher::new(&config, 0, u64::MAX).unwrap();
     assert_eq!(hasher.multipliers, ints(&fixture["layer_multipliers"]));
     assert_eq!(hasher.head_vocab_sizes, ints(&fixture["vocab_sizes"]));
 
@@ -302,7 +302,7 @@ fn released_checkpoint_ngram_hash_matches_upstream() {
         "ple_embed_dim": 128,
     });
     let config = config(&fixture, Some(&overrides));
-    let hasher = NgramHasher::new(&config, 0).unwrap();
+    let hasher = NgramHasher::new(&config, 0, u64::MAX).unwrap();
     assert_eq!(hasher.multipliers, ints(&released["layer_multipliers"]));
     assert_eq!(hasher.head_vocab_sizes, ints(&released["vocab_sizes"]));
     assert_eq!(hasher.head_offsets, ints(&released["offsets"]));
@@ -469,12 +469,12 @@ fn tiny_model_matches_upstream_logits_for_prefill_and_eight_decode_steps() {
     }
 }
 
-fn tiny_model(fixture: &Value) -> Qwen4ExpModel {
+pub(super) fn tiny_model(fixture: &Value) -> Qwen4ExpModel {
     let config: Qwen4ExpConfig = serde_json::from_value(fixture["config"].clone()).unwrap();
     Qwen4ExpModel::from_weights(&weights(fixture), &config.resolve().unwrap()).unwrap()
 }
 
-fn prompt_ids(fixture: &Value) -> UniquePtr<MlxArray> {
+pub(super) fn prompt_ids(fixture: &Value) -> UniquePtr<MlxArray> {
     let prompt: Vec<i32> = ints(&fixture["prompt"])
         .into_iter()
         .map(|t| t as i32)

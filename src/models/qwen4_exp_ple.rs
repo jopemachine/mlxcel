@@ -50,7 +50,7 @@ fn is_prime(value: u64) -> bool {
         return value == 2;
     }
     let mut divisor = 3;
-    while divisor * divisor <= value {
+    while divisor <= value / divisor {
         if value.is_multiple_of(divisor) {
             return false;
         }
@@ -59,16 +59,16 @@ fn is_prime(value: u64) -> bool {
     true
 }
 
-/// The `count`-th prime strictly greater than `start`.
-pub(crate) fn nth_prime_after(start: u64, count: usize) -> u64 {
-    let mut prime = start;
-    for _ in 0..count {
-        prime += 1;
-        while !is_prime(prime) {
-            prime += 1;
+/// The first prime strictly greater than `value`, or `None` past `limit`.
+fn next_prime_within(value: u64, limit: u64) -> Option<u64> {
+    let mut candidate = value.checked_add(1)?;
+    while candidate <= limit {
+        if is_prime(candidate) {
+            return Some(candidate);
         }
+        candidate = candidate.checked_add(1)?;
     }
-    prime
+    None
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,28 +85,53 @@ pub(crate) struct NgramHasher {
 }
 
 impl NgramHasher {
+    /// `table_rows` is the size of the n-gram table the checkpoint stores.
+    /// Every head vocabulary is a row range of it, so the prime search stops
+    /// as soon as the heads can no longer fit: the search is otherwise driven
+    /// by config values alone.
     pub(crate) fn new(
         config: &ResolvedQwen4ExpConfig,
         ple_layer_index: usize,
+        table_rows: u64,
     ) -> Result<Self, String> {
         let raw = &config.raw;
         let eos_token_id = config
             .eos_token_id
             .ok_or_else(|| "Qwen4-Exp PLE needs eos_token_id".to_string())?;
         let ngram_heads = config.ngram_heads();
+        let too_large = || {
+            format!(
+                "Qwen4-Exp PLE layer {ple_layer_index}: ngram_vocab_size_base {} with {ngram_heads} \
+                 n-gram heads per layer derives a table larger than the {table_rows} rows the \
+                 checkpoint stores",
+                raw.ngram_vocab_size_base
+            )
+        };
 
-        let mut head_vocab_sizes = Vec::with_capacity(ngram_heads);
-        let mut head_offsets = Vec::with_capacity(ngram_heads);
+        let first_head = ple_layer_index
+            .checked_mul(ngram_heads)
+            .ok_or_else(too_large)?;
+        let mut head_vocab_sizes = Vec::new();
+        let mut head_offsets = Vec::new();
         let mut total: u64 = 0;
-        for head in 0..ngram_heads {
-            let global_head = ple_layer_index * ngram_heads + head;
-            let size = nth_prime_after(raw.ngram_vocab_size_base - 1, global_head + 1);
-            head_vocab_sizes.push(size as i64);
+        let mut prime = raw.ngram_vocab_size_base - 1;
+        for global_head in 0..first_head + ngram_heads {
+            prime = next_prime_within(prime, table_rows).ok_or_else(too_large)?;
+            if global_head < first_head {
+                continue;
+            }
+            head_vocab_sizes.push(prime as i64);
             head_offsets.push(total as i64);
-            total += size;
+            total = total
+                .checked_add(prime)
+                .filter(|&total| total <= table_rows)
+                .ok_or_else(too_large)?;
         }
         let divisor = raw.make_ngram_vocab_size_divisible_by;
-        let padded_vocab_size = total.div_ceil(divisor) * divisor;
+        let padded_vocab_size = total
+            .div_ceil(divisor)
+            .checked_mul(divisor)
+            .ok_or_else(too_large)?;
 
         let multiplier_max = (i64::MAX as u64) / (raw.vocab_size as u64).max(1);
         let half_bound = (multiplier_max / 2).max(1);
@@ -196,6 +221,26 @@ pub(crate) struct ShardedEmbedding {
 }
 
 impl ShardedEmbedding {
+    pub(crate) fn stored_rows(
+        weights: &WeightMap,
+        prefix: &str,
+        num_shards: usize,
+    ) -> Result<u64, String> {
+        let mut rows: u64 = 0;
+        for index in 0..num_shards {
+            let key = format!("{prefix}.shards.{index}.weight");
+            let weight = weights
+                .get(&key)
+                .ok_or_else(|| format!("Qwen4-Exp checkpoint is missing {key}"))?;
+            let shape = mlxcel_core::array_shape(weight);
+            if shape.len() != 2 {
+                return Err(format!("{key} has shape {shape:?}, expected a 2-D table"));
+            }
+            rows += shape[0] as u64;
+        }
+        Ok(rows)
+    }
+
     pub(crate) fn from_weights(
         weights: &WeightMap,
         config: &ResolvedQwen4ExpConfig,
@@ -307,12 +352,15 @@ impl PleLayer {
         ple_layer_index: usize,
     ) -> Result<Self, String> {
         let raw = &config.raw;
-        let hasher = NgramHasher::new(config, ple_layer_index)?;
+        let table_prefix = format!("{prefix}.ple_embedding.ngram_embedding");
+        let table_rows =
+            ShardedEmbedding::stored_rows(weights, &table_prefix, raw.split_ngram_parts)?;
+        let hasher = NgramHasher::new(config, ple_layer_index, table_rows)?;
         let row_width = config.ple_embed_dim / hasher.ngram_heads();
         let table = ShardedEmbedding::from_weights(
             weights,
             config,
-            &format!("{prefix}.ple_embedding.ngram_embedding"),
+            &table_prefix,
             hasher.padded_vocab_size,
             row_width,
         )?;
@@ -465,6 +513,13 @@ fn verify_stored_hash_state(
         let Some(stored) = weights.get(&key) else {
             continue;
         };
+        let shape = mlxcel_core::array_shape(stored);
+        if shape != [expected.len() as i32] {
+            return Err(format!(
+                "{key} has shape {shape:?}, expected [{}]",
+                expected.len()
+            ));
+        }
         let stored = mlxcel_core::astype(stored, mlxcel_core::dtype::INT64);
         mlxcel_core::eval(&stored);
         let bytes = mlxcel_core::array_to_raw_bytes(&stored);
