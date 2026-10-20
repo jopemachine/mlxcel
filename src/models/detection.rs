@@ -712,6 +712,7 @@ pub fn model_type_has_native_video(model_type: ModelType) -> bool {
             | ModelType::Qwen3VLMoe
             | ModelType::Qwen35VLM
             | ModelType::Qwen35MoeVLM
+            | ModelType::Qwen4ExpVLM
     )
 }
 
@@ -887,6 +888,9 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
             ModelType::Qwen35Moe,
             ModelType::Qwen35MoeVLM,
         ),
+        // Qwen3.8-Flash-Next. Only the vision-language model exists; a prompt
+        // without images runs through the same wrapper.
+        "qwen4_exp" => Ok(ModelType::Qwen4ExpVLM),
         // mlx-vlm's text-only Qwen 3.5 exports (`mlx_vlm/models/qwen3_5_text`):
         // always the text model, so no VLM weight probe (#2384).
         "qwen3_5_text" => Ok(ModelType::Qwen35),

@@ -258,6 +258,7 @@ impl ModelType {
             ModelType::Qwen35VLM => "qwen3_5_vlm",
             ModelType::Qwen35Moe => "qwen3_5_moe",
             ModelType::Qwen35MoeVLM => "qwen3_5_moe_vlm",
+            ModelType::Qwen4ExpVLM => "qwen4_exp_vlm",
             ModelType::Gemma => "gemma",
             ModelType::Gemma2 => "gemma2",
             ModelType::Gemma3 => "gemma3",
@@ -690,6 +691,7 @@ fn model_type_keys(model_type: ModelType) -> &'static [&'static str] {
         ModelType::Qwen3Next => &["qwen3_next", "qwen3next"],
         ModelType::Qwen35 | ModelType::Qwen35VLM => &["qwen3_5", "qwen3_5_text"],
         ModelType::Qwen35Moe | ModelType::Qwen35MoeVLM => &["qwen3_5_moe", "qwen3_5_moe_text"],
+        ModelType::Qwen4ExpVLM => &["qwen4_exp"],
         ModelType::Qwen2Moe => &["qwen2_moe"],
         ModelType::Gemma => &["gemma"],
         ModelType::Gemma2 => &["gemma2"],
@@ -880,7 +882,8 @@ fn modalities_for(model_type: ModelType) -> &'static [Modality] {
         | ModelType::Qwen3VL
         | ModelType::Qwen3VLMoe
         | ModelType::Qwen35VLM
-        | ModelType::Qwen35MoeVLM => TEXT_IMAGE_VIDEO,
+        | ModelType::Qwen35MoeVLM
+        | ModelType::Qwen4ExpVLM => TEXT_IMAGE_VIDEO,
         _ if is_vlm_registry_type(model_type) => TEXT_IMAGE,
         _ => TEXT,
     }

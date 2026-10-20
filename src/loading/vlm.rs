@@ -109,6 +109,8 @@ mod pixtral;
 mod qwen;
 #[path = "vlm_qwen3_vision.rs"]
 mod qwen3_vision;
+#[path = "vlm_qwen4_exp.rs"]
+mod qwen4_exp;
 #[path = "vlm_siglip.rs"]
 mod siglip;
 #[path = "vlm_smolvlm.rs"]
@@ -176,6 +178,7 @@ pub(crate) use qwen::{
     load_qwen2_5_vl_iree_host_preprocessor, load_qwen2_vl_iree_host_preprocessor,
     load_qwen3_vl_iree_host_preprocessor,
 };
+pub(crate) use qwen4_exp::load_qwen4_exp_vlm;
 // Public (re-exported at the crate root): the CLI loads the speech stack
 // lazily, outside the LoadedModel dispatch.
 pub use qwen::load_qwen3_omni_speech;
