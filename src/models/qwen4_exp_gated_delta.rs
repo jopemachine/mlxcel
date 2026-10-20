@@ -27,6 +27,7 @@ use crate::models::gated_delta::{GatedDeltaCache, gated_delta_update};
 
 use super::config::ResolvedQwen4ExpConfig;
 use super::norm::GatedOutputNorm;
+use super::shapes;
 
 /// `x * rsqrt(sum(x^2) + 1e-6)` over the last axis, rounding to the input
 /// dtype after every op as upstream does.
@@ -93,9 +94,11 @@ impl Qwen4ExpGatedDeltaNet {
         let key_dim = raw.linear_key_head_dim * raw.linear_num_key_heads;
         let value_dim = raw.linear_value_head_dim * raw.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
-        let linear = |name: &str| {
+        let hidden = raw.hidden_size;
+        let linear = |name: &str, rows: usize, columns: usize| {
             let module = format!("{prefix}.{name}");
             let (group_size, bits) = config.quantization.for_module(&module);
+            shapes::expect_matrix(weights, &module, (group_size, bits), &[rows, columns])?;
             UnifiedLinear::from_weights(weights, &module, group_size, bits)
         };
         let tensor = |name: &str| {
@@ -104,6 +107,10 @@ impl Qwen4ExpGatedDeltaNet {
                 .get(&key)
                 .map(|w| mlxcel_core::copy(w))
                 .ok_or_else(|| format!("Qwen4-Exp checkpoint is missing {key}"))
+        };
+        let vector = |name: &str, len: usize| {
+            shapes::expect_vector(weights, &format!("{prefix}.{name}"), len)?;
+            tensor(name)
         };
         let conv1d_weight = tensor("conv1d.weight")?;
         let conv_shape = mlxcel_core::array_shape(&conv1d_weight);
@@ -122,18 +129,18 @@ impl Qwen4ExpGatedDeltaNet {
             conv_dim: conv_dim as i32,
             conv_kernel_size: raw.linear_conv_kernel_dim as i32,
             conv1d_weight,
-            in_proj_qkv: linear("in_proj_qkv")?,
-            in_proj_z: linear("in_proj_z")?,
-            in_proj_b: linear("in_proj_b")?,
-            in_proj_a: linear("in_proj_a")?,
-            dt_bias: tensor("dt_bias")?,
-            a_log: tensor("A_log")?,
+            in_proj_qkv: linear("in_proj_qkv", conv_dim, hidden)?,
+            in_proj_z: linear("in_proj_z", value_dim, hidden)?,
+            in_proj_b: linear("in_proj_b", raw.linear_num_value_heads, hidden)?,
+            in_proj_a: linear("in_proj_a", raw.linear_num_value_heads, hidden)?,
+            dt_bias: vector("dt_bias", raw.linear_num_value_heads)?,
+            a_log: vector("A_log", raw.linear_num_value_heads)?,
             norm: GatedOutputNorm::new(
-                tensor("norm.weight")?,
+                vector("norm.weight", raw.linear_value_head_dim)?,
                 raw.rms_norm_eps,
                 config.output_gate,
             ),
-            out_proj: linear("out_proj")?,
+            out_proj: linear("out_proj", hidden, value_dim)?,
         })
     }
 

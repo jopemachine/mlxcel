@@ -20,6 +20,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use super::config::OutputGate;
+use super::shapes;
 
 /// RMSNorm over zero-centered weights: `x * rsqrt(mean(x^2) + eps) * (1 + w)`,
 /// computed in float32 and cast back.
@@ -75,14 +76,13 @@ impl ZeroCenteredRmsNorm {
     pub(crate) fn from_weights(
         weights: &WeightMap,
         prefix: &str,
+        width: usize,
         group_size: Option<usize>,
         eps: f32,
     ) -> Result<Self, String> {
         let key = format!("{prefix}.weight");
-        let weight = weights
-            .get(&key)
-            .ok_or_else(|| format!("Qwen4-Exp checkpoint is missing {key}"))?;
-        Self::new(weight, group_size, eps)
+        shapes::expect_vector(weights, &key, width)?;
+        Self::new(&weights[&key], group_size, eps)
     }
 
     pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {

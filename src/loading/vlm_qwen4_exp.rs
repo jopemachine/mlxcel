@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use mlxcel_core::weights::WeightMap;
 use serde_json::Value;
 
 use crate::LoadedModel;
@@ -45,6 +46,25 @@ fn reject_deepstack(full_config: &Value) -> Result<()> {
     }
 }
 
+/// The merger's output rows are the width of the features scattered over the
+/// placeholder embeddings. Any width but the text `hidden_size` makes that
+/// scatter throw inside MLX on the first image or video request, which aborts
+/// the process; a missing merger is left to the encoder loader to report.
+fn check_merger_width(vision: &WeightMap, hidden_size: usize) -> Result<()> {
+    const MERGER_OUTPUT: &str = "vision_tower.merger.linear_fc2.weight";
+    let Some(weight) = vision.get(MERGER_OUTPUT) else {
+        return Ok(());
+    };
+    let shape = mlxcel_core::array_shape(weight);
+    if shape.first().map(|&rows| rows as usize) != Some(hidden_size) {
+        anyhow::bail!(
+            "Qwen4-Exp {MERGER_OUTPUT} has shape {shape:?}: the vision features must be \
+             text_config.hidden_size = {hidden_size} wide"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn load_qwen4_exp_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 
@@ -64,6 +84,7 @@ pub(crate) fn load_qwen4_exp_vlm(model_path: &Path) -> Result<LoadedModel> {
         .map_err(|error| anyhow::anyhow!("Failed to load Qwen4-Exp text model: {error}"))?;
     drop(text);
 
+    check_merger_width(&vision, text_config.raw.hidden_size)?;
     let vision_encoder = load_qwen3_vl_vision_encoder(&mut vision, &vision_config, "vision_tower")
         .map_err(|error| anyhow::anyhow!("Failed to load Qwen4-Exp vision encoder: {error}"))?;
     let processor =

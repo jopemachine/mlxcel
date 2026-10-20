@@ -157,3 +157,108 @@ fn stored_hash_tensors_of_the_wrong_shape_are_refused() {
         .expect("a 2-D multiplier tensor must be refused");
     assert!(error.contains("has shape [1, 3]"), "{error}");
 }
+
+/// Every projection, norm and gate vector is reshaped or multiplied by sizes
+/// taken from the config; a stored shape that disagrees would make MLX throw
+/// while the first forward pass is built.
+#[test]
+fn layer_tensors_that_disagree_with_the_config_are_refused() {
+    let fixture = fixture("model");
+    tiny_model(&fixture);
+    for case in [
+        ReshapedTensor {
+            name: "model.embed_tokens.weight",
+            shape: &[64, 16],
+        },
+        ReshapedTensor {
+            name: "lm_head.weight",
+            shape: &[48, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.in_proj_qkv.weight",
+            shape: &[96, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.in_proj_z.weight",
+            shape: &[32, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.in_proj_b.weight",
+            shape: &[2, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.out_proj.weight",
+            shape: &[32, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.dt_bias",
+            shape: &[8],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.A_log",
+            shape: &[2, 2],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.linear_attn.norm.weight",
+            shape: &[8],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.attn_hyper_connection.hc_norm.weight",
+            shape: &[64],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
+            shape: &[64, 16],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.mlp_hyper_connection.block_inject_weight.weight",
+            shape: &[2, 128],
+        },
+        ReshapedTensor {
+            name: "model.hyper_connection_mixer.input_mix_weight_down.weight",
+            shape: &[8, 128],
+        },
+        ReshapedTensor {
+            name: "model.layers.1.ple.key_proj.weight",
+            shape: &[64, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.1.ple.value_proj.weight",
+            shape: &[32, 16],
+        },
+        ReshapedTensor {
+            name: "model.layers.1.ple.norm_query.weight",
+            shape: &[64],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.q_proj.weight",
+            shape: &[128, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.k_proj.weight",
+            shape: &[32, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.v_proj.weight",
+            shape: &[64, 16],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.o_proj.weight",
+            shape: &[32, 64],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.k_norm.weight",
+            shape: &[16],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+            shape: &[32, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.3.self_attn.indexer.q_layernorm.weight",
+            shape: &[8],
+        },
+    ] {
+        assert_blames(&load_error(&fixture, case), case);
+    }
+}

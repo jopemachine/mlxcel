@@ -35,6 +35,7 @@ use crate::models::qwen3_vl::{InterleavedMRoPE, rotate_half};
 
 use super::config::ResolvedQwen4ExpConfig;
 use super::norm::ZeroCenteredRmsNorm;
+use super::shapes;
 
 /// Positions and rotary tables of one forward pass, shared by every attention
 /// layer and its indexer.
@@ -153,10 +154,20 @@ impl QsaIndexer {
         }
         let module = format!("{prefix}.index_qk_proj");
         let (group_size, bits) = config.quantization.for_module(&module);
+        shapes::expect_matrix(
+            weights,
+            &module,
+            (group_size, bits),
+            &[
+                (raw.indexer_n_heads + 1) * raw.indexer_head_dim,
+                raw.hidden_size,
+            ],
+        )?;
         let norm = |name: &str| {
             ZeroCenteredRmsNorm::from_weights(
                 weights,
                 &format!("{prefix}.{name}"),
+                raw.indexer_head_dim,
                 None,
                 raw.rms_norm_eps,
             )
@@ -406,24 +417,31 @@ impl QsaAttention {
         prefix: &str,
     ) -> Result<Self, String> {
         let raw = &config.raw;
-        let linear = |name: &str| {
+        let (hidden, head_dim) = (raw.hidden_size, config.head_dim);
+        let linear = |name: &str, rows: usize, columns: usize| {
             let module = format!("{prefix}.{name}");
             let (group_size, bits) = config.quantization.for_module(&module);
+            shapes::expect_matrix(weights, &module, (group_size, bits), &[rows, columns])?;
             UnifiedLinear::from_weights(weights, &module, group_size, bits)
         };
         let norm = |name: &str| {
             ZeroCenteredRmsNorm::from_weights(
                 weights,
                 &format!("{prefix}.{name}"),
+                head_dim,
                 None,
                 raw.rms_norm_eps,
             )
         };
+        let (query_width, kv_width) = (
+            raw.num_attention_heads * head_dim,
+            raw.num_key_value_heads * head_dim,
+        );
         Ok(Self {
-            q_proj: linear("q_proj")?,
-            k_proj: linear("k_proj")?,
-            v_proj: linear("v_proj")?,
-            o_proj: linear("o_proj")?,
+            q_proj: linear("q_proj", 2 * query_width, hidden)?,
+            k_proj: linear("k_proj", kv_width, hidden)?,
+            v_proj: linear("v_proj", kv_width, hidden)?,
+            o_proj: linear("o_proj", hidden, query_width)?,
             q_norm: norm("q_norm")?,
             k_norm: norm("k_norm")?,
             indexer: QsaIndexer::from_weights(weights, config, &format!("{prefix}.indexer"))?,

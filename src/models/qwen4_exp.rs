@@ -205,7 +205,14 @@ impl Qwen4ExpModel {
         config: &ResolvedQwen4ExpConfig,
     ) -> Result<Self, String> {
         let raw = &config.raw;
+        let vocabulary = [raw.vocab_size, raw.hidden_size];
         let (group_size, bits) = config.quantization.for_module("model.embed_tokens");
+        shapes::expect_matrix(
+            weights,
+            "model.embed_tokens",
+            (group_size, bits),
+            &vocabulary,
+        )?;
         let embed_tokens =
             UnifiedEmbedding::from_weights(weights, "model.embed_tokens", group_size, bits)?;
         let layers = (0..raw.num_hidden_layers)
@@ -217,6 +224,7 @@ impl Qwen4ExpModel {
             None
         } else {
             let (group_size, bits) = config.quantization.for_module("lm_head");
+            shapes::expect_matrix(weights, "lm_head", (group_size, bits), &vocabulary)?;
             Some(UnifiedLinear::from_weights(
                 weights, "lm_head", group_size, bits,
             )?)

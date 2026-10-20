@@ -29,6 +29,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 
 use super::config::ResolvedQwen4ExpConfig;
 use super::norm::ZeroCenteredRmsNorm;
+use super::shapes;
 
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const SPLITMIX_M1: u64 = 0xBF58_476D_1CE4_E5B9;
@@ -366,20 +367,28 @@ impl PleLayer {
         )?;
         verify_stored_hash_state(weights, prefix, &hasher)?;
 
-        let linear = |name: &str| {
+        let streams = raw.hc_count * raw.hidden_size;
+        let linear = |name: &str, rows: usize| {
             let module = format!("{prefix}.{name}");
             let (group_size, bits) = config.quantization.for_module(&module);
+            shapes::expect_matrix(
+                weights,
+                &module,
+                (group_size, bits),
+                &[rows, config.ple_embed_dim],
+            )?;
             UnifiedLinear::from_weights(weights, &module, group_size, bits)
         };
         let grouped_norm = |name: &str| {
             ZeroCenteredRmsNorm::from_weights(
                 weights,
                 &format!("{prefix}.{name}"),
+                streams,
                 Some(raw.hidden_size),
                 raw.rms_norm_eps,
             )
         };
-        let channels = (raw.hc_count * raw.hidden_size) as i32;
+        let channels = streams as i32;
         let conv_key = format!("{prefix}.conv1d.weight");
         let conv1d_weight = weights
             .get(&conv_key)
@@ -397,8 +406,8 @@ impl PleLayer {
             conv_state_len: (raw.ple_conv_kernel_size as i32 - 1) * conv_dilation,
             hasher,
             table,
-            key_proj: linear("key_proj")?,
-            value_proj: linear("value_proj")?,
+            key_proj: linear("key_proj", streams)?,
+            value_proj: linear("value_proj", raw.hidden_size)?,
             norm_key: grouped_norm("norm_key")?,
             norm_query: grouped_norm("norm_query")?,
             norm_conv: grouped_norm("norm_conv")?,

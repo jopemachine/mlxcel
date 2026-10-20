@@ -93,6 +93,14 @@ pub(crate) fn expect_matrix(
     Ok(())
 }
 
+/// The 1-D tensor under `key` exists and holds `len` entries.
+pub(crate) fn expect_vector(weights: &WeightMap, key: &str, len: usize) -> Result<(), String> {
+    if !weights.contains_key(key) {
+        return Err(format!("Qwen4-Exp checkpoint is missing {key}"));
+    }
+    expect_vector_if_present(weights, key, len)
+}
+
 fn expect_vector_if_present(weights: &WeightMap, key: &str, len: usize) -> Result<(), String> {
     let Some(tensor) = weights.get(key) else {
         return Ok(());

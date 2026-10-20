@@ -26,6 +26,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use super::config::ResolvedQwen4ExpConfig;
 use super::norm::ZeroCenteredRmsNorm;
+use super::shapes;
 
 pub(crate) struct GatedResidual {
     hc_norm: ZeroCenteredRmsNorm,
@@ -45,22 +46,26 @@ impl GatedResidual {
         prefix: &str,
         with_inject: bool,
     ) -> Result<Self, String> {
-        let linear = |name: &str| {
+        let raw = &config.raw;
+        let streams = raw.hc_count * raw.hidden_size;
+        let linear = |name: &str, rows: usize, columns: usize| {
             let module = format!("{prefix}.{name}");
             let (group_size, bits) = config.quantization.for_module(&module);
+            shapes::expect_matrix(weights, &module, (group_size, bits), &[rows, columns])?;
             UnifiedLinear::from_weights(weights, &module, group_size, bits)
         };
         Ok(Self {
             hc_norm: ZeroCenteredRmsNorm::from_weights(
                 weights,
                 &format!("{prefix}.hc_norm"),
-                Some(config.raw.hidden_size),
-                config.raw.rms_norm_eps,
+                streams,
+                Some(raw.hidden_size),
+                raw.rms_norm_eps,
             )?,
-            input_mix_weight_down: linear("input_mix_weight_down")?,
-            input_mix_weight_up: linear("input_mix_weight_up")?,
+            input_mix_weight_down: linear("input_mix_weight_down", raw.hc_lowrank, streams)?,
+            input_mix_weight_up: linear("input_mix_weight_up", streams, raw.hc_lowrank)?,
             block_inject_weight: if with_inject {
-                Some(linear("block_inject_weight")?)
+                Some(linear("block_inject_weight", raw.hc_count, streams)?)
             } else {
                 None
             },

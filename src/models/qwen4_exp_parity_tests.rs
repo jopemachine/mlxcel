@@ -176,8 +176,9 @@ fn zero_centered_and_grouped_rms_norm_match_upstream() {
     let fixture = fixture("norms");
     let weights = weights(&fixture);
     let x = hashed_input(&fixture["input"]);
-    let plain = ZeroCenteredRmsNorm::from_weights(&weights, "plain", None, 1e-6).unwrap();
-    let grouped = ZeroCenteredRmsNorm::from_weights(&weights, "grouped", Some(8), 1e-6).unwrap();
+    let plain = ZeroCenteredRmsNorm::from_weights(&weights, "plain", 32, None, 1e-6).unwrap();
+    let grouped =
+        ZeroCenteredRmsNorm::from_weights(&weights, "grouped", 32, Some(8), 1e-6).unwrap();
     assert_close("plain", &plain.forward(&x), &expected(&fixture["plain"]));
     assert_close(
         "grouped",

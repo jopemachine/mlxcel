@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use mlxcel_core::weights::WeightMap;
 use serde_json::json;
 
-use super::reject_deepstack;
+use super::{check_merger_width, reject_deepstack};
 
 #[test]
 fn deepstack_indexes_are_refused_by_name() {
@@ -35,4 +36,25 @@ fn absent_or_empty_deepstack_indexes_load() {
     ] {
         reject_deepstack(&config).unwrap_or_else(|error| panic!("{config}: {error}"));
     }
+}
+
+#[test]
+fn vision_features_must_match_the_text_width() {
+    let merger = |rows: i32| {
+        let mut vision = WeightMap::new();
+        vision.insert(
+            "vision_tower.merger.linear_fc2.weight".to_string(),
+            mlxcel_core::zeros(&[rows, 8], mlxcel_core::dtype::FLOAT32),
+        );
+        vision
+    };
+    check_merger_width(&merger(32), 32).expect("a 32-wide merger feeds a 32-wide text model");
+    let error = check_merger_width(&merger(16), 32)
+        .expect_err("a 16-wide merger must not load against a 32-wide text model");
+    assert!(
+        error
+            .to_string()
+            .contains("linear_fc2.weight has shape [16, 8]"),
+        "{error}"
+    );
 }
