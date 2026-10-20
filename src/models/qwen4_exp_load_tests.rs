@@ -17,10 +17,85 @@
 //! Each hostile case goes through the real loader and is paired with the
 //! honest fixture loading through the same entry point.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::parity_tests::{config, fixture, weights};
+use super::Qwen4ExpModel;
+use super::config::{Qwen4ExpConfig, ResolvedQwen4ExpConfig};
+use super::parity_tests::{config, fixture, hashed, tiny_model, weights};
 use super::ple::{NgramHasher, PleLayer};
+
+/// One stored tensor replaced by one of another shape.
+#[derive(Debug, Clone, Copy)]
+struct ReshapedTensor {
+    name: &'static str,
+    shape: &'static [i32],
+}
+
+fn tiny_config(fixture: &Value) -> ResolvedQwen4ExpConfig {
+    serde_json::from_value::<Qwen4ExpConfig>(fixture["config"].clone())
+        .unwrap()
+        .resolve()
+        .unwrap()
+}
+
+/// Loads the tiny model with `case` applied and returns the load error.
+#[track_caller]
+fn load_error(fixture: &Value, case: ReshapedTensor) -> String {
+    let mut weights = weights(fixture);
+    assert!(
+        weights.contains_key(case.name),
+        "{case:?} names no fixture tensor"
+    );
+    weights.insert(
+        case.name.to_string(),
+        hashed(case.name, case.shape, 0.1, 0.0),
+    );
+    Qwen4ExpModel::from_weights(&weights, &tiny_config(fixture))
+        .err()
+        .unwrap_or_else(|| panic!("{case:?} must be refused at load"))
+}
+
+#[track_caller]
+fn assert_blames(error: &str, case: ReshapedTensor) {
+    let module = case.name.strip_suffix(".weight").unwrap_or(case.name);
+    assert!(
+        error.contains(module) && error.contains("the config implies"),
+        "{case:?}: {error}"
+    );
+}
+
+/// The router's width is the index range `gather_qmm` reads the stacked
+/// expert planes with; a router wider than the stack, or a stack shorter than
+/// `num_experts`, would read past the planes at the first forward pass.
+#[test]
+fn moe_tensors_that_disagree_with_the_config_are_refused() {
+    let fixture = fixture("model");
+    tiny_model(&fixture);
+    for case in [
+        ReshapedTensor {
+            name: "model.layers.0.mlp.gate.weight",
+            shape: &[16, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.mlp.switch_mlp.gate_proj.weight",
+            shape: &[4, 16, 32],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.mlp.switch_mlp.down_proj.weight",
+            shape: &[8, 32, 8],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.mlp.shared_expert.up_proj.weight",
+            shape: &[24, 16],
+        },
+        ReshapedTensor {
+            name: "model.layers.0.mlp.shared_expert_gate.weight",
+            shape: &[2, 32],
+        },
+    ] {
+        assert_blames(&load_error(&fixture, case), case);
+    }
+}
 
 /// The heads must fit the table the checkpoint stores: one row short of the
 /// derived size is refused, the exact size loads.

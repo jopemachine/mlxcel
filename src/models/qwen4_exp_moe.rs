@@ -31,6 +31,7 @@ use crate::models::qwen3_next::{MLP, Quantization, Qwen3NextConfig, SwitchGLU};
 use crate::models::switch_layers::{fused_moe_enabled, moe_weighted_sum};
 
 use super::config::ResolvedQwen4ExpConfig;
+use super::shapes;
 
 pub(crate) struct Qwen4ExpMoeBlock {
     router: UnifiedLinear,
@@ -74,13 +75,39 @@ impl Qwen4ExpMoeBlock {
             check_expert_packing(weights, &module, experts_pair)?;
         }
         let shared_pair = pair_of(&projections("shared_expert"))?;
-        let linear = |name: &str| {
+
+        // The router's width is the expert index range `gather_qmm` reads the
+        // stacked planes with, so both must be `num_experts`.
+        let raw = &config.raw;
+        let (experts, hidden) = (raw.num_experts, raw.hidden_size);
+        let (routed, shared) = (
+            raw.moe_intermediate_size,
+            raw.shared_expert_intermediate_size,
+        );
+        for (name, dims) in [
+            ("gate_proj", [experts, routed, hidden]),
+            ("up_proj", [experts, routed, hidden]),
+            ("down_proj", [experts, hidden, routed]),
+        ] {
+            let module = format!("{prefix}.switch_mlp.{name}");
+            shapes::expect_matrix(weights, &module, experts_pair, &dims)?;
+        }
+        for (name, dims) in [
+            ("gate_proj", [shared, hidden]),
+            ("up_proj", [shared, hidden]),
+            ("down_proj", [hidden, shared]),
+        ] {
+            let module = format!("{prefix}.shared_expert.{name}");
+            shapes::expect_matrix(weights, &module, shared_pair, &dims)?;
+        }
+        let linear = |name: &str, rows: usize| {
             let module = format!("{prefix}.{name}");
             let (group_size, bits) = quantization.for_module(&module);
+            shapes::expect_matrix(weights, &module, (group_size, bits), &[rows, hidden])?;
             UnifiedLinear::from_weights(weights, &module, group_size, bits)
         };
         Ok(Self {
-            router: linear("gate")?,
+            router: linear("gate", experts)?,
             experts: SwitchGLU::from_weights(
                 weights,
                 &loader_config(config, experts_pair),
@@ -91,7 +118,7 @@ impl Qwen4ExpMoeBlock {
                 &loader_config(config, shared_pair),
                 &format!("{prefix}.shared_expert"),
             )?,
-            shared_expert_gate: linear("shared_expert_gate")?,
+            shared_expert_gate: linear("shared_expert_gate", 1)?,
             num_experts_per_tok: config.raw.num_experts_per_tok as i32,
             norm_topk_prob: config.raw.norm_topk_prob,
         })
@@ -150,9 +177,12 @@ fn check_expert_packing(
     ) else {
         return Ok(());
     };
-    let packed = *mlxcel_core::array_shape(weight).last().unwrap_or(&0);
-    let groups = *mlxcel_core::array_shape(scales).last().unwrap_or(&0);
-    let (unpacked, grouped) = (packed * 32 / bits, groups * group_size);
+    let packed = i64::from(*mlxcel_core::array_shape(weight).last().unwrap_or(&0));
+    let groups = i64::from(*mlxcel_core::array_shape(scales).last().unwrap_or(&0));
+    let (unpacked, grouped) = (
+        packed * 32 / i64::from(bits),
+        groups * i64::from(group_size),
+    );
     if unpacked == grouped {
         Ok(())
     } else {

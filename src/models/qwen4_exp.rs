@@ -48,6 +48,8 @@ mod ple;
 mod qsa;
 #[path = "qwen4_exp_sanitize.rs"]
 pub mod sanitize;
+#[path = "qwen4_exp_shapes.rs"]
+mod shapes;
 
 pub use config::{
     Qwen4ExpConfig, Qwen4ExpConfigError, ResolvedQwen4ExpConfig, text_config_from_full,
