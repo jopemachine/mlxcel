@@ -171,14 +171,6 @@ fn text_rope<'a>(mrope: &'a InterleavedMRoPE, batch: i32, start: i32, len: i32) 
     RopeContext::new(mrope, positions, dtype::FLOAT32)
 }
 
-fn mrope_for(config: &ResolvedQwen4ExpConfig) -> InterleavedMRoPE {
-    InterleavedMRoPE::new(
-        config.rope_dims(),
-        config.rope.rope_theta,
-        config.rope.mrope_section.clone(),
-    )
-}
-
 #[test]
 fn zero_centered_and_grouped_rms_norm_match_upstream() {
     let fixture = fixture("norms");
@@ -388,7 +380,11 @@ fn qsa_selects_the_upstream_blocks_on_a_4096_token_sequence() {
     let fixture = fixture("qsa");
     let config = config(&fixture, Some(&fixture["config_overrides"]));
     let indexer = QsaIndexer::from_weights(&weights(&fixture), &config, "indexer").unwrap();
-    let mrope = mrope_for(&config);
+    let mrope = InterleavedMRoPE::new(
+        config.rope_dims(),
+        config.rope.rope_theta,
+        config.rope.mrope_section.clone(),
+    );
     let hidden = hashed_input(&fixture["input"]);
     let sparse = &fixture["sparse"];
     let prefill = sparse["prefill"].as_i64().unwrap() as i32;
@@ -412,7 +408,11 @@ fn qsa_attends_densely_until_the_budget_is_exceeded() {
     let fixture = fixture("qsa");
     let config = config(&fixture, Some(&fixture["config_overrides"]));
     let indexer = QsaIndexer::from_weights(&weights(&fixture), &config, "indexer").unwrap();
-    let mrope = mrope_for(&config);
+    let mrope = InterleavedMRoPE::new(
+        config.rope_dims(),
+        config.rope.rope_theta,
+        config.rope.mrope_section.clone(),
+    );
     let hidden = hashed_input(&fixture["input"]);
     let dense = &fixture["dense_fallback"];
     let prefill = dense["prefill"].as_i64().unwrap() as i32;
@@ -443,17 +443,10 @@ fn qsa_attends_densely_until_the_budget_is_exceeded() {
 #[test]
 fn tiny_model_matches_upstream_logits_for_prefill_and_eight_decode_steps() {
     let fixture = fixture("model");
-    let config: Qwen4ExpConfig = serde_json::from_value(fixture["config"].clone()).unwrap();
-    let config = config.resolve().unwrap();
-    let model = Qwen4ExpModel::from_weights(&weights(&fixture), &config).unwrap();
-    let prompt: Vec<i32> = ints(&fixture["prompt"])
-        .into_iter()
-        .map(|t| t as i32)
-        .collect();
+    let model = tiny_model(&fixture);
 
     let mut caches = model.make_internal_caches();
-    let ids = mlxcel_core::from_slice_i32(&prompt, &[1, prompt.len() as i32]);
-    let hidden = model.forward_hidden(&ids, None, &mut caches, None);
+    let hidden = model.forward_hidden(&prompt_ids(&fixture), None, &mut caches, None);
     assert_close(
         "prefill logits",
         &model.logits(&hidden),
