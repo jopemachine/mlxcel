@@ -24,6 +24,7 @@ fn config(tie_word_embeddings: bool) -> ResolvedQwen4ExpConfig {
         "num_hidden_layers": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
+        "head_dim": 16,
         "linear_num_value_heads": 2,
         "linear_num_key_heads": 1,
         "linear_key_head_dim": 4,
@@ -39,7 +40,13 @@ fn config(tie_word_embeddings: bool) -> ResolvedQwen4ExpConfig {
         "ple_embed_dim": 16,
         "heads_per_ngram": 1,
         "eos_token_id": 1,
-        "tie_word_embeddings": tie_word_embeddings
+        "tie_word_embeddings": tie_word_embeddings,
+        "rope_parameters": {
+            "type": "default",
+            "mrope_section": [1, 1, 0],
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25
+        }
     }))
     .unwrap();
     config.resolve().unwrap()

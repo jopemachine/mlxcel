@@ -225,6 +225,22 @@ pub enum Qwen4ExpConfigError {
     PleStorage,
     #[error("Qwen4-Exp {field} must be positive")]
     Zero { field: &'static str },
+    #[error("Qwen4-Exp {field} ({value}) exceeds the MLX i32 dimension limit")]
+    I32Limit { field: &'static str, value: u128 },
+    #[error(
+        "Qwen4-Exp num_attention_heads ({heads}) must be divisible by num_key_value_heads ({kv_heads})"
+    )]
+    HeadGrouping { heads: usize, kv_heads: usize },
+    #[error("Qwen4-Exp num_experts_per_tok ({per_token}) must not exceed num_experts ({experts})")]
+    ExpertsPerToken { per_token: usize, experts: usize },
+    #[error(
+        "Qwen4-Exp rotary width head_dim * partial_rotary_factor = {rope_dims} must be even and in [2, head_dim = {head_dim}]"
+    )]
+    RopeWidth { rope_dims: usize, head_dim: usize },
+    #[error(
+        "Qwen4-Exp rope_parameters.mrope_section must hold three entries in [0, {half}], got {section:?}"
+    )]
+    MropeSection { section: Vec<i32>, half: usize },
     #[error(
         "Qwen4-Exp quantization.{module} declares group_size={group_size}, bits={bits}: {reason}"
     )]
@@ -252,7 +268,9 @@ pub struct ResolvedQwen4ExpConfig {
     pub ple_embed_dim: usize,
     /// Sorted, de-duplicated, one-indexed.
     pub ple_layer_ids: Vec<usize>,
-    pub layer_types: Vec<String>,
+    /// `None` when the kinds follow from `full_attention_interval`: a derived
+    /// list would be `num_hidden_layers` long before any weight bounds it.
+    pub layer_types: Option<Vec<String>>,
     pub output_gate: OutputGate,
     pub rope: Qwen4ExpRope,
     /// First entry when the config gives a list, as upstream's n-gram hash reads it.
@@ -279,6 +297,7 @@ impl Qwen4ExpConfig {
             ("full_attention_interval", self.full_attention_interval),
             ("indexer_n_heads", self.indexer_n_heads),
             ("indexer_head_dim", self.indexer_head_dim),
+            ("indexer_budget", self.indexer_budget),
         ] {
             if value == 0 {
                 return Err(Qwen4ExpConfigError::Zero { field });
@@ -296,21 +315,13 @@ impl Qwen4ExpConfig {
             .head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads);
         let ple_embed_dim = self.ple_embed_dim.unwrap_or(self.hidden_size);
+        self.check_i32_dimensions(head_dim, ple_embed_dim)?;
         let mut ple_layer_ids = self.ple_layer_ids.clone();
         ple_layer_ids.sort_unstable();
         ple_layer_ids.dedup();
 
-        let layer_types: Vec<String> = match &self.layer_types {
-            None => (0..self.num_hidden_layers)
-                .map(|i| {
-                    if (i + 1) % self.full_attention_interval != 0 {
-                        LINEAR_ATTENTION.to_string()
-                    } else {
-                        QWEN_SPARSE_ATTENTION.to_string()
-                    }
-                })
-                .collect(),
-            Some(kinds) => kinds
+        let layer_types: Option<Vec<String>> = self.layer_types.as_ref().map(|kinds| {
+            kinds
                 .iter()
                 .map(|kind| {
                     if kind == "full_attention" {
@@ -319,23 +330,47 @@ impl Qwen4ExpConfig {
                         kind.clone()
                     }
                 })
-                .collect(),
+                .collect()
+        });
+        if let Some(kinds) = &layer_types {
+            if kinds.len() != self.num_hidden_layers {
+                return Err(Qwen4ExpConfigError::LayerTypesLength {
+                    got: kinds.len(),
+                    expected: self.num_hidden_layers,
+                });
+            }
+            let mut unsupported: Vec<String> = kinds
+                .iter()
+                .filter(|kind| *kind != LINEAR_ATTENTION && *kind != QWEN_SPARSE_ATTENTION)
+                .cloned()
+                .collect();
+            if !unsupported.is_empty() {
+                unsupported.sort();
+                unsupported.dedup();
+                return Err(Qwen4ExpConfigError::UnsupportedLayerTypes(unsupported));
+            }
+        }
+        let is_linear = |layer_idx: usize| {
+            is_linear_layer(
+                layer_types.as_deref(),
+                self.full_attention_interval,
+                layer_idx,
+            )
         };
-        if layer_types.len() != self.num_hidden_layers {
-            return Err(Qwen4ExpConfigError::LayerTypesLength {
-                got: layer_types.len(),
-                expected: self.num_hidden_layers,
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
+            return Err(Qwen4ExpConfigError::HeadGrouping {
+                heads: self.num_attention_heads,
+                kv_heads: self.num_key_value_heads,
             });
         }
-        let mut unsupported: Vec<String> = layer_types
-            .iter()
-            .filter(|kind| *kind != LINEAR_ATTENTION && *kind != QWEN_SPARSE_ATTENTION)
-            .cloned()
-            .collect();
-        if !unsupported.is_empty() {
-            unsupported.sort();
-            unsupported.dedup();
-            return Err(Qwen4ExpConfigError::UnsupportedLayerTypes(unsupported));
+        if self.num_experts_per_tok > self.num_experts {
+            return Err(Qwen4ExpConfigError::ExpertsPerToken {
+                per_token: self.num_experts_per_tok,
+                experts: self.num_experts,
+            });
         }
         if self.hc_count <= 1 {
             return Err(Qwen4ExpConfigError::HcCount(self.hc_count));
@@ -385,7 +420,7 @@ impl Qwen4ExpConfig {
         let non_linear: Vec<usize> = ple_layer_ids
             .iter()
             .copied()
-            .filter(|&id| layer_types[id - 1] != LINEAR_ATTENTION)
+            .filter(|&id| !is_linear(id - 1))
             .collect();
         if !non_linear.is_empty() {
             return Err(Qwen4ExpConfigError::PleOnNonLinearLayer(non_linear));
@@ -415,6 +450,7 @@ impl Qwen4ExpConfig {
             }
         }
         let rope = parse_rope(self.rope_parameters.as_ref())?;
+        check_rope_geometry(&rope, head_dim)?;
         let quantization = QuantizationTable::from_config(self.quantization.as_ref())?;
 
         Ok(ResolvedQwen4ExpConfig {
@@ -431,9 +467,145 @@ impl Qwen4ExpConfig {
     }
 }
 
+impl Qwen4ExpConfig {
+    /// Every size the model hands to MLX as an `i32`, alone or as the product
+    /// it is used as, must fit one.
+    fn check_i32_dimensions(
+        &self,
+        head_dim: usize,
+        ple_embed_dim: usize,
+    ) -> Result<(), Qwen4ExpConfigError> {
+        let product = |factors: &[usize]| {
+            factors
+                .iter()
+                .fold(1u128, |acc, &factor| acc.saturating_mul(factor as u128))
+        };
+        let key_dim = product(&[self.linear_key_head_dim, self.linear_num_key_heads]);
+        let value_dim = product(&[self.linear_value_head_dim, self.linear_num_value_heads]);
+        for (field, value) in [
+            ("hidden_size", self.hidden_size as u128),
+            ("num_attention_heads", self.num_attention_heads as u128),
+            ("num_key_value_heads", self.num_key_value_heads as u128),
+            ("head_dim", head_dim as u128),
+            (
+                "linear_num_value_heads",
+                self.linear_num_value_heads as u128,
+            ),
+            ("linear_num_key_heads", self.linear_num_key_heads as u128),
+            ("linear_key_head_dim", self.linear_key_head_dim as u128),
+            ("linear_value_head_dim", self.linear_value_head_dim as u128),
+            (
+                "linear_conv_kernel_dim",
+                self.linear_conv_kernel_dim as u128,
+            ),
+            ("num_experts", self.num_experts as u128),
+            ("num_experts_per_tok", self.num_experts_per_tok as u128),
+            (
+                "shared_expert_intermediate_size",
+                self.shared_expert_intermediate_size as u128,
+            ),
+            ("moe_intermediate_size", self.moe_intermediate_size as u128),
+            ("vocab_size", self.vocab_size as u128),
+            ("hc_count", self.hc_count as u128),
+            ("hc_lowrank", self.hc_lowrank as u128),
+            ("ple_embed_dim", ple_embed_dim as u128),
+            ("ple_conv_kernel_size", self.ple_conv_kernel_size as u128),
+            ("ngram_size", self.ngram_size as u128),
+            ("heads_per_ngram", self.heads_per_ngram as u128),
+            ("split_ngram_parts", self.split_ngram_parts as u128),
+            ("indexer_n_heads", self.indexer_n_heads as u128),
+            ("indexer_head_dim", self.indexer_head_dim as u128),
+            ("indexer_budget", self.indexer_budget as u128),
+            (
+                "indexer_compress_ratio",
+                self.indexer_compress_ratio as u128,
+            ),
+            (
+                "hc_count * hidden_size",
+                product(&[self.hc_count, self.hidden_size]),
+            ),
+            (
+                "2 * num_attention_heads * head_dim",
+                product(&[2, self.num_attention_heads, head_dim]),
+            ),
+            (
+                "num_key_value_heads * head_dim",
+                product(&[self.num_key_value_heads, head_dim]),
+            ),
+            (
+                "(indexer_n_heads + 1) * indexer_head_dim",
+                product(&[
+                    self.indexer_n_heads.saturating_add(1),
+                    self.indexer_head_dim,
+                ]),
+            ),
+            ("linear key dim", key_dim),
+            ("linear value dim", value_dim),
+            (
+                "linear conv dim",
+                key_dim.saturating_mul(2).saturating_add(value_dim),
+            ),
+            (
+                "(ple_conv_kernel_size - 1) * ngram_size",
+                product(&[self.ple_conv_kernel_size.saturating_sub(1), self.ngram_size]),
+            ),
+        ] {
+            if value > i32::MAX as u128 {
+                return Err(Qwen4ExpConfigError::I32Limit { field, value });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_linear_layer(
+    layer_types: Option<&[String]>,
+    full_attention_interval: usize,
+    layer_idx: usize,
+) -> bool {
+    match layer_types {
+        Some(kinds) => kinds[layer_idx] == LINEAR_ATTENTION,
+        None => !(layer_idx + 1).is_multiple_of(full_attention_interval),
+    }
+}
+
+fn rope_dims(head_dim: usize, partial_rotary_factor: f32) -> usize {
+    (head_dim as f32 * partial_rotary_factor) as usize
+}
+
+/// The rotary tables are `rope_dims` wide and slice the first `rope_dims`
+/// channels of every head, and `InterleavedMRoPE` walks each section once
+/// per forward and indexes the `[3, ..]` position rows by section number.
+fn check_rope_geometry(rope: &Qwen4ExpRope, head_dim: usize) -> Result<(), Qwen4ExpConfigError> {
+    let dims = rope_dims(head_dim, rope.partial_rotary_factor);
+    if dims < 2 || dims > head_dim || !dims.is_multiple_of(2) {
+        return Err(Qwen4ExpConfigError::RopeWidth {
+            rope_dims: dims,
+            head_dim,
+        });
+    }
+    let half = dims / 2;
+    let section = &rope.mrope_section;
+    if section.len() != 3
+        || section
+            .iter()
+            .any(|&entry| entry < 0 || entry as usize > half)
+    {
+        return Err(Qwen4ExpConfigError::MropeSection {
+            section: section.clone(),
+            half,
+        });
+    }
+    Ok(())
+}
+
 impl ResolvedQwen4ExpConfig {
     pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
-        self.layer_types[layer_idx] == LINEAR_ATTENTION
+        is_linear_layer(
+            self.layer_types.as_deref(),
+            self.raw.full_attention_interval,
+            layer_idx,
+        )
     }
 
     /// Zero-based index into `ple_layer_ids` of decoder layer `layer_idx`.
@@ -445,7 +617,7 @@ impl ResolvedQwen4ExpConfig {
 
     /// Rotary width shared by attention and the QSA indexer.
     pub fn rope_dims(&self) -> usize {
-        (self.head_dim as f32 * self.rope.partial_rotary_factor) as usize
+        rope_dims(self.head_dim, self.rope.partial_rotary_factor)
     }
 
     pub fn ngram_heads(&self) -> usize {

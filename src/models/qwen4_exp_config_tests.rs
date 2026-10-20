@@ -117,8 +117,22 @@ fn full_attention_layer_types_are_renamed_to_qwen_sparse_attention() {
         })
         .collect();
     let config = resolve(json!({ "layer_types": types })).unwrap();
-    assert_eq!(config.layer_types[3], QWEN_SPARSE_ATTENTION);
-    assert_eq!(config.layer_types[0], LINEAR_ATTENTION);
+    let kinds = config.layer_types.as_ref().expect("listed kinds are kept");
+    assert_eq!(kinds[3], QWEN_SPARSE_ATTENTION);
+    assert_eq!(kinds[0], LINEAR_ATTENTION);
+}
+
+/// The layer count is not bounded until the weights load, so kinds derived
+/// from `full_attention_interval` are answered per layer, not materialized.
+#[test]
+fn derived_layer_kinds_keep_no_per_layer_list() {
+    assert!(resolve(json!({})).unwrap().layer_types.is_none());
+
+    let layers: u64 = 1 << 40;
+    let config = resolve(json!({ "num_hidden_layers": layers })).unwrap();
+    assert!(config.layer_types.is_none());
+    assert!(config.is_linear_layer(0));
+    assert!(!config.is_linear_layer(layers as usize - 1));
 }
 
 #[test]
@@ -201,6 +215,42 @@ rejects! {
     rejects_a_zero_hidden_size:
         json!({ "hidden_size": 0 })
         => Qwen4ExpConfigError::Zero { field: "hidden_size" };
+    rejects_a_zero_indexer_budget:
+        json!({ "indexer_budget": 0 })
+        => Qwen4ExpConfigError::Zero { field: "indexer_budget" };
+    rejects_kv_heads_that_do_not_divide_the_query_heads:
+        json!({ "num_key_value_heads": 5 })
+        => Qwen4ExpConfigError::HeadGrouping { heads: 24, kv_heads: 5 };
+    rejects_more_experts_per_token_than_experts:
+        json!({ "num_experts_per_tok": 513 })
+        => Qwen4ExpConfigError::ExpertsPerToken { per_token: 513, experts: 512 };
+    rejects_a_dimension_past_the_i32_limit:
+        json!({ "hidden_size": 2_147_483_648u64 })
+        => Qwen4ExpConfigError::I32Limit { field: "hidden_size", value: 2_147_483_648 };
+    rejects_a_compress_ratio_that_would_truncate_to_zero:
+        json!({ "indexer_compress_ratio": 4_294_967_296u64 })
+        => Qwen4ExpConfigError::I32Limit { field: "indexer_compress_ratio", value: 4_294_967_296 };
+    rejects_a_product_past_the_i32_limit:
+        json!({ "hc_count": 1_048_576 })
+        => Qwen4ExpConfigError::I32Limit { field: "hc_count * hidden_size", value: 2_684_354_560 };
+    rejects_a_rotary_width_wider_than_the_head:
+        json!({ "rope_parameters": { "type": "default", "mrope_section": [11, 11, 10], "rope_theta": 10000000, "partial_rotary_factor": 1.5 } })
+        => Qwen4ExpConfigError::RopeWidth { rope_dims: 384, head_dim: 256 };
+    rejects_an_odd_rotary_width:
+        json!({ "rope_parameters": { "type": "default", "mrope_section": [11, 11, 10], "rope_theta": 10000000, "partial_rotary_factor": 0.25390625 } })
+        => Qwen4ExpConfigError::RopeWidth { rope_dims: 65, head_dim: 256 };
+    rejects_an_empty_mrope_section:
+        json!({ "rope_parameters": { "type": "default", "mrope_section": [], "rope_theta": 10000000, "partial_rotary_factor": 0.25 } })
+        => Qwen4ExpConfigError::MropeSection { section: vec![], half: 32 };
+    rejects_a_fourth_mrope_section:
+        json!({ "rope_parameters": { "type": "default", "mrope_section": [11, 11, 10, 1], "rope_theta": 10000000, "partial_rotary_factor": 0.25 } })
+        => Qwen4ExpConfigError::MropeSection { section: vec![11, 11, 10, 1], half: 32 };
+    rejects_a_negative_mrope_section:
+        json!({ "rope_parameters": { "type": "default", "mrope_section": [11, -1, 10], "rope_theta": 10000000, "partial_rotary_factor": 0.25 } })
+        => Qwen4ExpConfigError::MropeSection { section: vec![11, -1, 10], half: 32 };
+    rejects_an_mrope_section_wider_than_the_rotary_half:
+        json!({ "rope_parameters": { "type": "default", "mrope_section": [11, 700000000, 10], "rope_theta": 10000000, "partial_rotary_factor": 0.25 } })
+        => Qwen4ExpConfigError::MropeSection { section: vec![11, 700_000_000, 10], half: 32 };
 }
 
 /// A pair reaches `gather_qmm` / `quantized_matmul` either as the default the
