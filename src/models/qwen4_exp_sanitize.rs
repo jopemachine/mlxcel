@@ -20,6 +20,8 @@
 //! mlx-vlm (`language_model.model.*`) and mlx-lm/OptiQ (`model.*`) layouts all
 //! map onto them.
 
+use std::collections::BTreeSet;
+
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -110,12 +112,22 @@ pub fn sanitize_weights(
         text.insert(key, value);
     }
 
-    for layer in 0..config.raw.num_hidden_layers {
-        let prefix = format!("model.layers.{layer}.mlp");
+    // Visit the layers whose experts the checkpoint stores rather than
+    // `0..num_hidden_layers`: the config count is unbounded until the loader
+    // fails on the first missing layer.
+    let expert_blocks: BTreeSet<String> = text
+        .keys()
+        .filter_map(|key| {
+            let (layer, rest) = key.strip_prefix("model.layers.")?.split_once('.')?;
+            rest.starts_with("mlp.experts.")
+                .then(|| format!("model.layers.{layer}.mlp"))
+        })
+        .collect();
+    for prefix in &expert_blocks {
         for projection in ["gate_proj", "up_proj", "down_proj"] {
-            stack_per_expert(&mut text, &prefix, projection, config.raw.num_experts)?;
+            stack_per_expert(&mut text, prefix, projection, config.raw.num_experts)?;
         }
-        split_fused_gate_up(&mut text, &prefix)?;
+        split_fused_gate_up(&mut text, prefix)?;
     }
     Ok(SanitizedWeights { text, vision })
 }
@@ -139,14 +151,25 @@ fn stack_per_expert(
         if !weights.contains_key(&format!("{prefix}.experts.0.{projection}.{suffix}")) {
             continue;
         }
-        let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(num_experts);
+        let mut parts: Vec<UniquePtr<MlxArray>> = Vec::new();
+        let mut first_shape = None;
         for expert in 0..num_experts {
             let key = format!("{prefix}.experts.{expert}.{projection}.{suffix}");
-            parts.push(
-                weights
-                    .remove(&key)
-                    .ok_or_else(|| format!("Qwen4-Exp checkpoint is missing {key}"))?,
-            );
+            let part = weights
+                .remove(&key)
+                .ok_or_else(|| format!("Qwen4-Exp checkpoint is missing {key}"))?;
+            let shape = mlxcel_core::array_shape(&part);
+            match &first_shape {
+                None => first_shape = Some(shape),
+                Some(first) if *first != shape => {
+                    return Err(format!(
+                        "{key} has shape {shape:?}, but expert 0 has {first:?}: \
+                         the experts cannot be stacked"
+                    ));
+                }
+                Some(_) => {}
+            }
+            parts.push(part);
         }
         weights.insert(
             format!("{prefix}.switch_mlp.{projection}.{suffix}"),
@@ -191,11 +214,14 @@ fn split_fused_gate_up(weights: &mut WeightMap, prefix: &str) -> Result<(), Stri
             continue;
         };
         let shape = mlxcel_core::array_shape(&value);
-        let axis = if suffix == "bias" {
-            shape.len() - 1
-        } else {
-            shape.len() - 2
-        };
+        let rank = if suffix == "bias" { 2 } else { 3 };
+        if shape.len() != rank {
+            return Err(format!(
+                "{source}.{suffix} must be [num_experts, output_rows{}], got shape {shape:?}",
+                if rank == 3 { ", input_columns" } else { "" }
+            ));
+        }
+        let axis = 1;
         let rows = shape[axis];
         if rows % 2 != 0 {
             return Err(format!(
@@ -205,8 +231,8 @@ fn split_fused_gate_up(weights: &mut WeightMap, prefix: &str) -> Result<(), Stri
         for (half, target) in ["gate_proj", "up_proj"].into_iter().enumerate() {
             let mut start = vec![0; shape.len()];
             let mut stop = shape.clone();
-            start[axis] = half as i32 * rows / 2;
-            stop[axis] = (half as i32 + 1) * rows / 2;
+            start[axis] = half as i32 * (rows / 2);
+            stop[axis] = (half as i32 + 1) * (rows / 2);
             let part = mlxcel_core::slice(&value, &start, &stop);
             weights.insert(
                 format!("{prefix}.switch_mlp.{target}.{suffix}"),

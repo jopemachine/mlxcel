@@ -17,8 +17,8 @@ use serde_json::json;
 use super::*;
 use crate::models::qwen4_exp::config::Qwen4ExpConfig;
 
-fn config(tie_word_embeddings: bool) -> ResolvedQwen4ExpConfig {
-    let config: Qwen4ExpConfig = serde_json::from_value(json!({
+fn config(patch: serde_json::Value) -> ResolvedQwen4ExpConfig {
+    let mut raw = json!({
         "model_type": "qwen4_exp_text",
         "hidden_size": 8,
         "num_hidden_layers": 4,
@@ -40,15 +40,17 @@ fn config(tie_word_embeddings: bool) -> ResolvedQwen4ExpConfig {
         "ple_embed_dim": 16,
         "heads_per_ngram": 1,
         "eos_token_id": 1,
-        "tie_word_embeddings": tie_word_embeddings,
         "rope_parameters": {
             "type": "default",
             "mrope_section": [1, 1, 0],
             "rope_theta": 10000000,
             "partial_rotary_factor": 0.25
         }
-    }))
-    .unwrap();
+    });
+    for (key, value) in patch.as_object().expect("patch is an object") {
+        raw[key] = value.clone();
+    }
+    let config: Qwen4ExpConfig = serde_json::from_value(raw).unwrap();
     config.resolve().unwrap()
 }
 
@@ -128,7 +130,7 @@ fn sanitize_splits_vision_drops_mtp_and_moves_conv_axes() {
     );
     weights.insert("lm_head.weight".into(), tensor(&[16, 8]));
 
-    let sanitized = sanitize_weights(weights, &config(false)).unwrap();
+    let sanitized = sanitize_weights(weights, &config(json!({}))).unwrap();
     assert!(sanitized.text.keys().all(|key| !key.contains("mtp")));
     assert!(
         sanitized
@@ -147,7 +149,8 @@ fn sanitize_splits_vision_drops_mtp_and_moves_conv_axes() {
 fn tied_embeddings_drop_the_lm_head() {
     let mut weights = WeightMap::new();
     weights.insert("lm_head.weight".into(), tensor(&[16, 8]));
-    let sanitized = sanitize_weights(weights, &config(true)).unwrap();
+    let sanitized =
+        sanitize_weights(weights, &config(json!({ "tie_word_embeddings": true }))).unwrap();
     assert!(!sanitized.text.contains_key("lm_head.weight"));
 }
 
@@ -163,7 +166,7 @@ fn per_expert_projections_are_stacked_in_expert_order() {
             );
         }
     }
-    let sanitized = sanitize_weights(weights, &config(false)).unwrap();
+    let sanitized = sanitize_weights(weights, &config(json!({}))).unwrap();
     for projection in ["gate_proj", "up_proj", "down_proj"] {
         let stacked =
             &sanitized.text[&format!("model.layers.0.mlp.switch_mlp.{projection}.weight")];
@@ -187,7 +190,7 @@ fn fused_gate_up_experts_are_split_into_gate_and_up() {
         "model.layers.0.mlp.experts.down_proj".into(),
         tensor(&[3, 2, 2]),
     );
-    let sanitized = sanitize_weights(weights, &config(false)).unwrap();
+    let sanitized = sanitize_weights(weights, &config(json!({}))).unwrap();
     let gate = &sanitized.text["model.layers.0.mlp.switch_mlp.gate_proj.weight"];
     let up = &sanitized.text["model.layers.0.mlp.switch_mlp.up_proj.weight"];
     assert_eq!(mlxcel_core::array_shape(gate), vec![3, 2, 2]);
@@ -207,8 +210,109 @@ fn fp8_checkpoints_are_refused_by_name() {
         "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv".into(),
         tensor(&[1, 1]),
     );
-    let error = sanitize_weights(weights, &config(false))
+    let error = sanitize_weights(weights, &config(json!({})))
         .err()
         .expect("FP8 is refused");
     assert!(error.contains("weight_scale_inv"), "{error}");
+}
+
+/// Sanitize walks the expert blocks the checkpoint stores, so its work is
+/// bounded by the tensors and not by the declared layer count.
+#[test]
+fn sanitize_visits_the_expert_blocks_the_checkpoint_stores() {
+    let per_expert = || {
+        let mut weights = WeightMap::new();
+        for layer in [0, 5] {
+            for expert in 0..3 {
+                weights.insert(
+                    format!("model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"),
+                    tensor(&[2, 4]),
+                );
+            }
+        }
+        weights
+    };
+    for layers in [4u64, 1 << 40] {
+        let sanitized = sanitize_weights(
+            per_expert(),
+            &config(json!({ "num_hidden_layers": layers })),
+        )
+        .unwrap();
+        for layer in [0, 5] {
+            assert!(
+                sanitized.text.contains_key(&format!(
+                    "model.layers.{layer}.mlp.switch_mlp.gate_proj.weight"
+                )),
+                "{layers} declared layers: layer {layer} is not stacked"
+            );
+        }
+        assert!(sanitized.text.keys().all(|key| !key.contains(".experts.")));
+    }
+}
+
+/// `stack` throws inside MLX on parts of different shapes, which aborts the
+/// process; the loader names the odd expert instead.
+#[test]
+fn per_expert_tensors_of_different_shapes_are_refused() {
+    let mut weights = WeightMap::new();
+    for expert in 0..3 {
+        let shape: &[i32] = if expert == 2 { &[2, 5] } else { &[2, 4] };
+        weights.insert(
+            format!("model.layers.0.mlp.experts.{expert}.gate_proj.weight"),
+            tensor(shape),
+        );
+    }
+    let error = sanitize_weights(weights, &config(json!({})))
+        .err()
+        .expect("mismatched experts must be refused");
+    assert!(
+        error.contains("model.layers.0.mlp.experts.2.gate_proj.weight has shape [2, 5]"),
+        "{error}"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FusedRankCase {
+    suffix: &'static str,
+    shape: &'static [i32],
+}
+
+/// Every fused plane is split on its row axis, so a plane of another rank is
+/// refused by name before that axis is indexed.
+#[test]
+fn fused_expert_planes_of_the_wrong_rank_are_refused() {
+    for case in [
+        FusedRankCase {
+            suffix: "scales",
+            shape: &[4],
+        },
+        FusedRankCase {
+            suffix: "biases",
+            shape: &[3, 4],
+        },
+        FusedRankCase {
+            suffix: "bias",
+            shape: &[],
+        },
+    ] {
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "model.layers.0.mlp.experts.gate_up_proj.weight".into(),
+            tensor(&[3, 4, 2]),
+        );
+        weights.insert(
+            format!("model.layers.0.mlp.experts.gate_up_proj.{}", case.suffix),
+            tensor(case.shape),
+        );
+        let error = sanitize_weights(weights, &config(json!({})))
+            .err()
+            .unwrap_or_else(|| panic!("{case:?} must be refused"));
+        assert!(
+            error.contains(&format!(
+                "gate_up_proj.{} must be [num_experts",
+                case.suffix
+            )),
+            "{case:?}: {error}"
+        );
+    }
 }
