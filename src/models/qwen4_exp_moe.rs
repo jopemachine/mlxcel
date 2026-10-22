@@ -28,7 +28,6 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::models::qwen3_next::{MLP, Quantization, Qwen3NextConfig, SwitchGLU};
-use crate::models::switch_layers::{fused_moe_enabled, moe_weighted_sum};
 
 use super::config::ResolvedQwen4ExpConfig;
 use super::shapes;
@@ -140,24 +139,24 @@ impl Qwen4ExpMoeBlock {
         let topk = mlxcel_core::slice(&order, &[0, kth], &[tokens, n_experts]);
         let mut scores = mlxcel_core::take_along_axis(&gates, &topk, -1);
         if self.norm_topk_prob {
-            let sum = mlxcel_core::sum_axis(&scores, -1, true);
+            let sum = mlxcel_core::sum_axis_native_dtype(&scores, -1, true);
             scores = mlxcel_core::divide(&scores, &sum);
         }
 
-        let fused = if tokens == 1 && fused_moe_enabled() {
-            self.experts
-                .forward_fused_kernel(&x_flat, &topk, &scores)
-                .map(|out| mlxcel_core::reshape(&out, &[1, hidden]))
-        } else {
-            None
-        };
-        let routed = fused.unwrap_or_else(|| {
-            let expert_out = self.experts.forward(&x_flat, &topk);
-            moe_weighted_sum(&expert_out, &scores, mlxcel_core::array_dtype(&x_flat))
-        });
+        // The generic fused MoE kernel accumulates expert outputs in float32.
+        // Qwen4 checkpoints require bf16 rounding before weighting and summing
+        // the selected experts, including single-token decode.
+        let expert_out = self.experts.forward(&x_flat, &topk);
+        let scores = mlxcel_core::expand_dims(&scores, -1);
+        let weighted = mlxcel_core::multiply(&expert_out, &scores);
+        let routed = mlxcel_core::sum_axis_native_dtype(&weighted, -2, false);
 
         let shared = self.shared_expert.forward(&x_flat);
-        let shared_gate = mlxcel_core::sigmoid(&self.shared_expert_gate.forward(&x_flat));
+        let shared_gate = mlxcel_core::sigmoid(&super::linear::row_invariant_projection(
+            &self.shared_expert_gate,
+            x,
+        ));
+        let shared_gate = mlxcel_core::reshape(&shared_gate, &[tokens, 1]);
         let out = mlxcel_core::add(&routed, &mlxcel_core::multiply(&shared, &shared_gate));
         mlxcel_core::reshape(&out, &shape)
     }

@@ -168,7 +168,7 @@ fn text_rope<'a>(mrope: &'a InterleavedMRoPE, batch: i32, start: i32, len: i32) 
         &mlxcel_core::reshape(&positions, &[1, 1, len]),
         &[3, batch, len],
     );
-    RopeContext::new(mrope, positions, dtype::FLOAT32)
+    RopeContext::new(mrope, positions)
 }
 
 #[test]
@@ -750,4 +750,268 @@ fn tiny_vlm_matches_upstream_on_an_image_prompt() {
         let out = vlm.forward(&token, &mut [], None);
         assert_close(&format!("decode step {step}"), &out, &expected(logits));
     }
+}
+
+/// Anonymous batch rows must retain separate histories across prefill and decode.
+#[test]
+fn anonymous_batch_matches_independent_sequences() {
+    let fixture = fixture("model");
+    let batched = tiny_model(&fixture);
+    let singles = [tiny_model(&fixture), tiny_model(&fixture)];
+    let prompt: Vec<i32> = ints(&fixture["prompt"])
+        .into_iter()
+        .map(|t| t as i32)
+        .collect();
+    let mut other = prompt.clone();
+    other.reverse();
+    for rows in [
+        [prompt[..17].to_vec(), other[..17].to_vec()],
+        [prompt[17..].to_vec(), other[17..].to_vec()],
+        [vec![3], vec![7]],
+        [vec![5], vec![11]],
+    ] {
+        let len = rows[0].len() as i32;
+        let flat: Vec<i32> = rows.iter().flatten().copied().collect();
+        let input = mlxcel_core::from_slice_i32(&flat, &[2, len]);
+        let actual = batched.forward_batched(&input, &mut [], None);
+        mlxcel_core::eval(&actual);
+        let shape = mlxcel_core::array_shape(&actual);
+        for (row, model) in singles.iter().enumerate() {
+            let input = mlxcel_core::from_slice_i32(&rows[row], &[1, len]);
+            let expected = model.forward(&input, &mut [], None);
+            let actual_row = mlxcel_core::slice(
+                &actual,
+                &[row as i32, 0, 0],
+                &[row as i32 + 1, len, shape[2]],
+            );
+            assert_close("anonymous batch row", &actual_row, &values(&expected));
+        }
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn hyper_stream_mean_preserves_bfloat16_reference_rounding() {
+    // mlx-vlm abd3b2d7: mx.mean(x, axis=-2), with bf16 x shaped [1, 1, 4, 1].
+    // These stream values occur in the real OptiQ checkpoint. Promoting the
+    // reduction to float32 changes 18.625 to 18.5 before the next projection.
+    let streams = mlxcel_core::from_slice_f32(&[19.125, 17.75, 17.875, 19.5], &[1, 1, 4, 1]);
+    let streams = mlxcel_core::astype(&streams, dtype::BFLOAT16);
+    let mean = mlxcel_core::mean_axis_native_dtype(&streams, -2, false);
+    assert_eq!(values(&mean), vec![18.625]);
+    assert_eq!(mlxcel_core::array_dtype(&mean), dtype::BFLOAT16);
+}
+
+#[test]
+fn quantized_gate_prefill_matches_independent_decode_rows() {
+    use mlxcel_core::layers::UnifiedLinear;
+    let dense = mlxcel_core::astype(&hashed("gate.weight", &[4, 256], 0.1, 0.0), dtype::BFLOAT16);
+    let packed = mlxcel_core::quantize_weights(&dense, 32, 8);
+    let mut weights = WeightMap::new();
+    weights.insert(
+        "gate.weight".into(),
+        mlxcel_core::quantized_weights_w(&packed),
+    );
+    weights.insert(
+        "gate.scales".into(),
+        mlxcel_core::quantized_weights_scales(&packed),
+    );
+    weights.insert(
+        "gate.biases".into(),
+        mlxcel_core::quantized_weights_biases(&packed),
+    );
+    let linear = UnifiedLinear::from_weights(&weights, "gate", 32, 8).unwrap();
+    let input = mlxcel_core::astype(
+        &hashed("gate.input", &[2, 17, 256], 1.0, 0.0),
+        dtype::BFLOAT16,
+    );
+    let batched = super::linear::row_invariant_projection(&linear, &input);
+    for batch in 0..2 {
+        for token in 0..17 {
+            let row = mlxcel_core::slice(&input, &[batch, token, 0], &[batch + 1, token + 1, 256]);
+            let expected = linear.forward(&mlxcel_core::contiguous(&row, false));
+            let actual =
+                mlxcel_core::slice(&batched, &[batch, token, 0], &[batch + 1, token + 1, 4]);
+            assert_eq!(
+                values(&actual),
+                values(&expected),
+                "batch {batch}, token {token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bf16_delta_preserves_float32_state_across_prefill_chunks() {
+    use crate::models::gated_delta::gated_delta_update_precise;
+    let input =
+        |name| mlxcel_core::astype(&hashed(name, &[1, 5, 1, 128], 0.1, 0.0), dtype::BFLOAT16);
+    let q = input("precision.q");
+    let k = input("precision.k");
+    let v = input("precision.v");
+    let a = mlxcel_core::astype(
+        &hashed("precision.a", &[1, 5, 1], 0.2, 0.0),
+        dtype::BFLOAT16,
+    );
+    let b = mlxcel_core::astype(
+        &hashed("precision.b", &[1, 5, 1], 0.2, 0.0),
+        dtype::BFLOAT16,
+    );
+    let a_log = mlxcel_core::from_slice_f32(&[0.125], &[1]);
+    let dt = mlxcel_core::astype(
+        &mlxcel_core::from_slice_f32(&[0.125], &[1]),
+        dtype::BFLOAT16,
+    );
+    let (whole, whole_state) =
+        gated_delta_update_precise(&q, &k, &v, &a, &b, &a_log, &dt, None, None);
+    assert_eq!(mlxcel_core::array_dtype(&whole_state), dtype::FLOAT32);
+    assert_eq!(mlxcel_core::array_dtype(&whole), dtype::BFLOAT16);
+    let mut state = None;
+    for t in 0..5 {
+        let row = |x: &MlxArray| mlxcel_core::slice(x, &[0, t, 0, 0], &[1, t + 1, 1, 128]);
+        let gate = |x: &MlxArray| mlxcel_core::slice(x, &[0, t, 0], &[1, t + 1, 1]);
+        let (out, next) = gated_delta_update_precise(
+            &row(&q),
+            &row(&k),
+            &row(&v),
+            &gate(&a),
+            &gate(&b),
+            &a_log,
+            &dt,
+            state.as_deref(),
+            None,
+        );
+        assert_eq!(mlxcel_core::array_dtype(&next), dtype::FLOAT32);
+        assert_close("chunked delta output", &out, &values(&row(&whole)));
+        state = Some(next);
+    }
+    assert_close(
+        "chunked delta state",
+        state.as_ref().unwrap(),
+        &values(&whole_state),
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn sparse_qsa_keeps_only_selected_blocks_and_causal_tail() {
+    let q = mlxcel_core::zeros(&[1, 2, 4, 32], dtype::BFLOAT16);
+    let k = mlxcel_core::zeros(&[1, 1, 10, 32], dtype::BFLOAT16);
+    let v: Vec<f32> = (0..10)
+        .flat_map(|t| std::iter::repeat_n(t as f32, 32))
+        .collect();
+    let v = mlxcel_core::astype(
+        &mlxcel_core::from_slice_f32(&v, &[1, 1, 10, 32]),
+        dtype::BFLOAT16,
+    );
+    let blocks = mlxcel_core::from_slice_i32(&[-1, -1, -1, 0, -1, 1, -1, 0], &[1, 4, 2]);
+    let ends = mlxcel_core::from_slice_i32(&[3, 5, 8, 10], &[1, 4]);
+    let out = mlxcel_core::qwen4_qsa_attention(&q, &k, &v, &blocks, &ends, 0.125, 4);
+    // Uniform attention: [0,1,2], [0..4], [4..7], and [0..3,8,9].
+    let expected: Vec<f32> = (0..2)
+        .flat_map(|_| {
+            [1.0, 2.0, 5.5, 23.0 / 6.0]
+                .into_iter()
+                .flat_map(|x| std::iter::repeat_n(x, 32))
+        })
+        .collect();
+    let expected = mlxcel_core::astype(
+        &mlxcel_core::from_slice_f32(&expected, &[1, 2, 4, 32]),
+        dtype::BFLOAT16,
+    );
+    assert_eq!(values(&out), values(&expected));
+    // Sparse decode uses this same reduction after the index budget is exceeded.
+    let decode_q = mlxcel_core::slice(&q, &[0, 0, 3, 0], &[1, 2, 4, 32]);
+    let decode_blocks = mlxcel_core::slice(&blocks, &[0, 3, 0], &[1, 4, 2]);
+    let decode_ends = mlxcel_core::from_slice_i32(&[10], &[1, 1]);
+    let decoded =
+        mlxcel_core::qwen4_qsa_attention(&decode_q, &k, &v, &decode_blocks, &decode_ends, 0.125, 4);
+    let last = mlxcel_core::slice(&out, &[0, 0, 3, 0], &[1, 2, 4, 32]);
+    assert_eq!(values(&decoded), values(&last));
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn bf16_multimodal_rope_matches_upstream_at_long_positions() {
+    let fixture = fixture("rotary_bf16");
+    let x = mlxcel_core::astype(&hashed_input(&fixture["input"]), dtype::BFLOAT16);
+    let positions: Vec<i32> = ints(&fixture["positions"])
+        .into_iter()
+        .map(|p| p as i32)
+        .collect();
+    let positions = mlxcel_core::from_slice_i32(&positions, &[3, 1, 3]);
+    let rope = InterleavedMRoPE::new_with_backend_frequencies(64, 10_000_000.0, vec![11, 11, 10]);
+    let output = rope
+        .apply_metal(&x, &positions)
+        .expect("Metal fixture requires Metal");
+    assert_eq!(values(&output), expected(&fixture["output"]));
+    let tail = |a: &MlxArray| mlxcel_core::slice(a, &[0, 0, 0, 64], &[1, 1, 3, 128]);
+    assert_eq!(values(&tail(&output)), values(&tail(&x)));
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn bf16_moe_decode_matches_reference_expert_rounding() {
+    let fixture = fixture("moe_bf16");
+    let config = config(&fixture, None);
+    let mut quantized = WeightMap::new();
+    for (name, weight) in weights(&fixture) {
+        let weight = mlxcel_core::astype(&weight, dtype::BFLOAT16);
+        if name.ends_with("_proj.weight") {
+            let prefix = name.strip_suffix(".weight").unwrap();
+            quantized.insert(
+                format!("{prefix}.scales"),
+                mlxcel_core::quantize_weights_scales(&weight, 32, 4),
+            );
+            quantized.insert(
+                format!("{prefix}.biases"),
+                mlxcel_core::quantize_weights_biases(&weight, 32, 4),
+            );
+            quantized.insert(name, mlxcel_core::quantize_weights_w(&weight, 32, 4));
+        } else {
+            quantized.insert(name, weight);
+        }
+    }
+    let moe = super::moe::Qwen4ExpMoeBlock::from_weights(&quantized, &config, "moe").unwrap();
+    let input = mlxcel_core::astype(&hashed_input(&fixture["input"]), dtype::BFLOAT16);
+    assert_eq!(values(&moe.forward(&input)), expected(&fixture["output"]));
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn fused_delta_projection_matches_singleton_quantized_outputs() {
+    use mlxcel_core::layers::{QuantizedWeight, UnifiedLinear};
+    let make = |name: &str, rows: i32, bits: i32| {
+        let w = mlxcel_core::astype(&hashed(name, &[rows, 64], 0.125, 0.0), dtype::BFLOAT16);
+        UnifiedLinear::new(
+            QuantizedWeight::new(
+                mlxcel_core::quantize_weights_w(&w, 32, bits),
+                mlxcel_core::quantize_weights_scales(&w, 32, bits),
+                mlxcel_core::quantize_weights_biases(&w, 32, bits),
+                32,
+                bits,
+            ),
+            None,
+        )
+    };
+    let layers = [
+        make("qkv", 128, 4),
+        make("z", 64, 4),
+        make("b", 16, 4),
+        make("a", 16, 4),
+    ];
+    let refs: Vec<_> = layers.iter().collect();
+    let fused = super::linear::fused_decode_projection(&refs).unwrap();
+    let input = mlxcel_core::astype(
+        &hashed("delta_input", &[1, 1, 64], 2.0, 0.0),
+        dtype::BFLOAT16,
+    );
+    let actual = values(&fused.forward(&input));
+    let expected: Vec<_> = layers
+        .iter()
+        .flat_map(|linear| values(&linear.forward(&input)))
+        .collect();
+    assert_eq!(actual, expected);
+    let different = make("different", 16, 8);
+    assert!(super::linear::fused_decode_projection(&[&layers[0], &different]).is_none());
 }

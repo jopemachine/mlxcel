@@ -4971,7 +4971,11 @@ fn activation_helpers_return_the_input_dtype() {
         (crate::dtype::FLOAT32, "f32"),
     ] {
         let x = full_f32(&[4, 8], 0.75, dtype);
-        let cases: [(&str, UniquePtr<MlxArray>); 5] = [
+        let cases: [(&str, UniquePtr<MlxArray>); 9] = [
+            ("qwen4_activate", qwen4_hyper_activate(&x, 4)),
+            ("qwen4_gate", qwen4_hyper_gate(&x, 4)),
+            ("qwen4_mix", qwen4_hyper_mix(&x, &x)),
+            ("qwen4_inject", qwen4_hyper_inject(&x, &x, &x)),
             ("silu", silu(&x)),
             ("gelu", gelu(&x)),
             ("gelu_approx", gelu_approx(&x)),

@@ -1,7 +1,8 @@
 # PR #2475: Implementation review of Qwen3.8-Flash-Next (qwen4_exp) support
 
+> **Hardening update, 2026-10-23:** The sections below preserve the original 2026-10-20 review and its then-open items. Those runtime limitations have since been addressed: anonymous batches retain independent rows; OptiQ folded norm scales load correctly; bf16 reductions, recurrent precision, native indexed QSA and MRoPE match the updated reference. The real 80.8 GB checkpoint now passes CLI and server text/image/video/long-context checks, streaming, 13,308 tests, and paired performance measurements on M3 Ultra. See the [current validation report](../docs/benchmark_results/qwen4-exp-m3-ultra-2026-10-23.md) for results, raw data, source revisions and remaining feature exclusions.
+
 **Date**: 2026-10-20
-**Author**: AI Code Reviewer
 **Status**: Reviewed; four fixes pushed on the PR branch; three items left for a decision or for the 128 GB machine
 **Languages**: Rust, Python (fixture generator only)
 **Risk Level**: Medium (a new model family behind its own `qwen4_exp` detection arm; no shared function changed; the real 80.8 GB checkpoint has not been run)

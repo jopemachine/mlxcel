@@ -20,7 +20,6 @@
 //! gate. This is not DeepSeek-V4's Sinkhorn `HyperConnection`.
 
 use mlxcel_core::layers::UnifiedLinear;
-use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -82,12 +81,10 @@ impl GatedResidual {
     }
 
     fn mix(&self, normed: &MlxArray) -> UniquePtr<MlxArray> {
-        let hc = self.hc_count as f32;
         let down = self.input_mix_weight_down.forward(normed);
-        let activated = silu(&mlxcel_core::divide_scalar(&down, hc));
-        let gates = mlxcel_core::sigmoid(&self.input_mix_weight_up.forward(&activated));
-        let weighted = mlxcel_core::multiply(&self.streams(&gates), &self.streams(normed));
-        mlxcel_core::mean_axis(&weighted, -2, false)
+        let activated = mlxcel_core::qwen4_hyper_activate(&down, self.hc_count);
+        let projected = self.input_mix_weight_up.forward(&activated);
+        mlxcel_core::qwen4_hyper_mix(&self.streams(&projected), &self.streams(normed))
     }
 
     /// The mixer path: the `[B, L, hidden]` mixed stream.
@@ -104,8 +101,8 @@ impl GatedResidual {
             .block_inject_weight
             .as_ref()
             .expect("split() is only called on a sublayer hyper-connection");
-        let projected = mlxcel_core::divide_scalar(&inject.forward(&normed), self.hc_count as f32);
-        let weights = mlxcel_core::multiply_scalar(&mlxcel_core::sigmoid(&projected), 2.0);
+        let projected = super::linear::row_invariant_projection(inject, &normed);
+        let weights = mlxcel_core::qwen4_hyper_gate(&projected, self.hc_count);
         (mixed, weights)
     }
 
@@ -118,8 +115,7 @@ impl GatedResidual {
     ) -> UniquePtr<MlxArray> {
         let branch = mlxcel_core::expand_dims(branch, -2);
         let weights = mlxcel_core::expand_dims(weights, -1);
-        let injection = mlxcel_core::multiply(&branch, &weights);
-        let injection = mlxcel_core::reshape(&injection, &mlxcel_core::array_shape(hyper));
-        mlxcel_core::add(hyper, &injection)
+        let output = mlxcel_core::qwen4_hyper_inject(&branch, &weights, &self.streams(hyper));
+        mlxcel_core::reshape(&output, &mlxcel_core::array_shape(hyper))
     }
 }

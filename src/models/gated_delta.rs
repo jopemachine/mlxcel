@@ -276,7 +276,7 @@ pub fn gated_delta_ops(
     state: Option<&MlxArray>,
     mask: Option<&MlxArray>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-    gated_delta_ops_with_parity(q, k, v, g, beta, state, mask, false)
+    gated_delta_ops_with_parity(q, k, v, g, beta, state, mask, false, false)
 }
 
 /// Body of [`gated_delta_ops`] with the chain-parity switch.
@@ -302,6 +302,7 @@ fn gated_delta_ops_with_parity(
     state: Option<&MlxArray>,
     mask: Option<&MlxArray>,
     chain_parity: bool,
+    preserve_precision: bool,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     let shape = mlxcel_core::array_shape(q);
     let b = shape[0];
@@ -335,7 +336,19 @@ fn gated_delta_ops_with_parity(
         // SAFETY: Metal kernel reads from valid input arrays, writes to output/new_state.
         // mask_ptr is null when mask is None, which the C++ side handles correctly.
         unsafe {
-            if chain_parity {
+            if preserve_precision {
+                mlxcel_core::metal_gated_delta_forward_precise(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    &current_state,
+                    mask_ptr,
+                    &mut output,
+                    &mut new_state,
+                );
+            } else if chain_parity {
                 warn_if_chain_parity_forfeited_by_shape(g, mask);
                 mlxcel_core::metal_gated_delta_forward_chain_parity(
                     q,
@@ -764,6 +777,26 @@ pub fn gated_delta_update(
     gated_delta_update_with_lower_bound(q, k, v, a, b, a_log, dt_bias, state, mask, None)
 }
 
+/// Qwen4-Exp keeps decay gates and persistent recurrent state in float32,
+/// including when activations use bf16. Other model paths retain their existing
+/// state-storage policy.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_update_precise(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    a: &MlxArray,
+    b: &MlxArray,
+    a_log: &MlxArray,
+    dt_bias: &MlxArray,
+    state: Option<&MlxArray>,
+    mask: Option<&MlxArray>,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let beta = mlxcel_core::sigmoid(b);
+    let g = compute_g(a_log, a, dt_bias);
+    gated_delta_ops_with_parity(q, k, v, &g, &beta, state, mask, false, true)
+}
+
 /// [`gated_delta_update`] with the optional gate lower bound of
 /// [`compute_g_lower_bounded`].
 ///
@@ -825,7 +858,17 @@ pub fn gated_delta_update_chain_parity(
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     let beta = mlxcel_core::sigmoid(b);
     let g = compute_g(a_log, a, dt_bias);
-    gated_delta_ops_with_parity(q, k, v, &g, &beta, state, mask, chain_parity_enabled())
+    gated_delta_ops_with_parity(
+        q,
+        k,
+        v,
+        &g,
+        &beta,
+        state,
+        mask,
+        chain_parity_enabled(),
+        false,
+    )
 }
 
 /// Diagnostic escape hatch for the chain-parity kernel:

@@ -23,7 +23,7 @@ use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 
-use crate::models::gated_delta::{GatedDeltaCache, gated_delta_update};
+use crate::models::gated_delta::{GatedDeltaCache, gated_delta_update_precise};
 
 use super::config::ResolvedQwen4ExpConfig;
 use super::norm::GatedOutputNorm;
@@ -39,7 +39,7 @@ use super::shapes;
 pub(crate) fn l2_normalize(x: &MlxArray) -> UniquePtr<MlxArray> {
     let x_dtype = mlxcel_core::array_dtype(x);
     let squared = mlxcel_core::square(x);
-    let sum = mlxcel_core::sum_axis(&squared, -1, true);
+    let sum = mlxcel_core::sum_axis_native_dtype(&squared, -1, true);
     let eps = mlxcel_core::full_f32(&[1], 1e-6, x_dtype);
     let inv = mlxcel_core::rsqrt(&mlxcel_core::add(&sum, &eps));
     mlxcel_core::multiply(x, &inv)
@@ -69,6 +69,7 @@ pub(crate) struct Qwen4ExpGatedDeltaNet {
     in_proj_z: UnifiedLinear,
     in_proj_b: UnifiedLinear,
     in_proj_a: UnifiedLinear,
+    decode_projection: Option<UnifiedLinear>,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
     norm: GatedOutputNorm,
@@ -120,6 +121,16 @@ impl Qwen4ExpGatedDeltaNet {
                 "{prefix}.conv1d.weight has shape {conv_shape:?}, expected {expected:?}"
             ));
         }
+        let in_proj_qkv = linear("in_proj_qkv", conv_dim, hidden)?;
+        let in_proj_z = linear("in_proj_z", value_dim, hidden)?;
+        let in_proj_b = linear("in_proj_b", raw.linear_num_value_heads, hidden)?;
+        let in_proj_a = linear("in_proj_a", raw.linear_num_value_heads, hidden)?;
+        let decode_projection = super::linear::fused_decode_projection(&[
+            &in_proj_qkv,
+            &in_proj_z,
+            &in_proj_b,
+            &in_proj_a,
+        ]);
         Ok(Self {
             num_k_heads: raw.linear_num_key_heads as i32,
             num_v_heads: raw.linear_num_value_heads as i32,
@@ -129,10 +140,11 @@ impl Qwen4ExpGatedDeltaNet {
             conv_dim: conv_dim as i32,
             conv_kernel_size: raw.linear_conv_kernel_dim as i32,
             conv1d_weight,
-            in_proj_qkv: linear("in_proj_qkv", conv_dim, hidden)?,
-            in_proj_z: linear("in_proj_z", value_dim, hidden)?,
-            in_proj_b: linear("in_proj_b", raw.linear_num_value_heads, hidden)?,
-            in_proj_a: linear("in_proj_a", raw.linear_num_value_heads, hidden)?,
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_b,
+            in_proj_a,
+            decode_projection,
             dt_bias: vector("dt_bias", raw.linear_num_value_heads)?,
             a_log: vector("A_log", raw.linear_num_value_heads)?,
             norm: GatedOutputNorm::new(
@@ -152,11 +164,40 @@ impl Qwen4ExpGatedDeltaNet {
         let shape = mlxcel_core::array_shape(inputs);
         let (b, s) = (shape[0], shape[1]);
 
-        let qkv = self.in_proj_qkv.forward(inputs);
-        let z = self.in_proj_z.forward(inputs);
+        let fused = self.decode_projection.as_ref().filter(|linear| {
+            s == 1
+                && matches!(linear, UnifiedLinear::Quantized { weight, .. }
+                if mlxcel_core::array_dtype(&weight.scales) == mlxcel_core::array_dtype(inputs))
+        });
+        let (qkv, z, b_proj, a) = if let Some(linear) = fused {
+            let projected = linear.forward(inputs);
+            let widths = [
+                self.conv_dim,
+                self.num_v_heads * self.head_v_dim,
+                self.num_v_heads,
+                self.num_v_heads,
+            ];
+            let mut offset = 0;
+            let mut split = |width| {
+                let part = mlxcel_core::slice(&projected, &[0, 0, offset], &[b, s, offset + width]);
+                offset += width;
+                part
+            };
+            (
+                split(widths[0]),
+                split(widths[1]),
+                split(widths[2]),
+                split(widths[3]),
+            )
+        } else {
+            (
+                self.in_proj_qkv.forward(inputs),
+                self.in_proj_z.forward(inputs),
+                super::linear::row_invariant_projection(&self.in_proj_b, inputs),
+                super::linear::row_invariant_projection(&self.in_proj_a, inputs),
+            )
+        };
         let z = mlxcel_core::reshape(&z, &[b, s, self.num_v_heads, self.head_v_dim]);
-        let b_proj = self.in_proj_b.forward(inputs);
-        let a = self.in_proj_a.forward(inputs);
 
         let qkv_dtype = mlxcel_core::array_dtype(&qkv);
         let n_keep = self.conv_kernel_size - 1;
@@ -206,7 +247,7 @@ impl Qwen4ExpGatedDeltaNet {
             .and_then(|c| c.state_cache.as_ref())
             .filter(|state| mlxcel_core::array_shape(state)[0] == b)
             .map(|state| mlxcel_core::copy(state));
-        let (out, new_state) = gated_delta_update(
+        let (out, new_state) = gated_delta_update_precise(
             &q,
             &k,
             &v,

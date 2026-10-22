@@ -65,6 +65,36 @@ fn check_merger_width(vision: &WeightMap, hidden_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// OptiQ's Qwen4 converter folds `1 + weight` into these stored norms.
+/// Its `optiq_vision` metadata identifies the converted checkpoint; ordinary
+/// HF and mlx-vlm weights remain zero-centered. Undo the storage conversion
+/// in float32 so the model reconstructs the stored scale without bf16 loss.
+/// `linear_attn.norm` is a conventional gated norm and must stay untouched.
+fn restore_optiq_zero_centered_norms(weights: &mut WeightMap, config: &Value) {
+    if !config.get("optiq_vision").is_some_and(Value::is_object) {
+        return;
+    }
+    const FOLDED: &[&str] = &[
+        "q_layernorm.weight",
+        "k_layernorm.weight",
+        "q_norm.weight",
+        "k_norm.weight",
+        "hc_norm.weight",
+        "norm_key.weight",
+        "norm_query.weight",
+        "norm_conv.weight",
+    ];
+    for (name, weight) in weights.iter_mut() {
+        if name.starts_with("model.") && FOLDED.iter().any(|suffix| name.ends_with(suffix)) {
+            let scale = mlxcel_core::astype(weight, mlxcel_core::dtype::FLOAT32);
+            *weight = mlxcel_core::subtract(
+                &scale,
+                &mlxcel_core::full_f32(&[], 1.0, mlxcel_core::dtype::FLOAT32),
+            );
+        }
+    }
+}
+
 pub(crate) fn load_qwen4_exp_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 
@@ -77,9 +107,12 @@ pub(crate) fn load_qwen4_exp_vlm(model_path: &Path) -> Result<LoadedModel> {
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
     let weights = load_vlm_weights_common(model_path, None)?;
-    let models::qwen4_exp::SanitizedWeights { text, mut vision } =
-        models::qwen4_exp::sanitize_weights(weights, &text_config)
-            .map_err(|error| anyhow::anyhow!(error))?;
+    let models::qwen4_exp::SanitizedWeights {
+        mut text,
+        mut vision,
+    } = models::qwen4_exp::sanitize_weights(weights, &text_config)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    restore_optiq_zero_centered_norms(&mut text, &full_config);
     let text_model = models::Qwen4ExpModel::from_weights(&text, &text_config)
         .map_err(|error| anyhow::anyhow!("Failed to load Qwen4-Exp text model: {error}"))?;
     drop(text);

@@ -262,3 +262,48 @@ fn layer_tensors_that_disagree_with_the_config_are_refused() {
         assert_blames(&load_error(&fixture, case), case);
     }
 }
+
+#[test]
+fn ple_shards_refuse_malformed_quantization_sidecars() {
+    use super::ple::ShardedEmbedding;
+    let fixture = fixture("ple");
+    let config = config(
+        &fixture,
+        Some(&json!({
+            "split_ngram_parts": 1,
+            "quantization": {"group_size": 32, "bits": 4}
+        })),
+    );
+    let prefix = "ple.ple_embedding.ngram_embedding";
+    let module = format!("{prefix}.shards.0");
+    let tensor = hashed("shard", &[2, 64], 0.1, 0.0);
+    let packed = mlxcel_core::quantize_weights(&tensor, 32, 4);
+    let mut weights = mlxcel_core::weights::WeightMap::new();
+    weights.insert(
+        format!("{module}.weight"),
+        mlxcel_core::quantized_weights_w(&packed),
+    );
+    weights.insert(
+        format!("{module}.scales"),
+        mlxcel_core::quantized_weights_scales(&packed),
+    );
+    weights.insert(
+        format!("{module}.biases"),
+        mlxcel_core::quantized_weights_biases(&packed),
+    );
+    ShardedEmbedding::from_weights(&weights, &config, prefix, 2, 64)
+        .expect("valid quantized shard");
+    for suffix in ["scales", "biases"] {
+        let key = format!("{module}.{suffix}");
+        let original = weights.remove(&key).unwrap();
+        weights.insert(
+            key.clone(),
+            mlxcel_core::zeros(&[1, 2], mlxcel_core::dtype::FLOAT32),
+        );
+        let error = ShardedEmbedding::from_weights(&weights, &config, prefix, 2, 64)
+            .err()
+            .expect("mismatched sidecar rows must fail at load");
+        assert!(error.contains(&key), "{error}");
+        weights.insert(key, original);
+    }
+}

@@ -86,18 +86,15 @@ impl ZeroCenteredRmsNorm {
     }
 
     pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        let input_dtype = mlxcel_core::array_dtype(x);
         let shape = mlxcel_core::array_shape(x);
-        let mut y = mlxcel_core::astype(x, dtype::FLOAT32);
+        let mut y = mlxcel_core::copy(x);
         if let Some(group) = self.group_size {
             let mut grouped = shape[..shape.len() - 1].to_vec();
             grouped.extend([-1, group]);
             y = mlxcel_core::reshape(&y, &grouped);
         }
-        let normed = mlxcel_core::fast_rms_norm_no_weight(&y, self.eps);
-        let scaled = mlxcel_core::multiply(&normed, &self.scale);
-        let scaled = mlxcel_core::reshape(&scaled, &shape);
-        mlxcel_core::astype(&scaled, input_dtype)
+        let normed = mlxcel_core::compiled_scaled_rms_norm(&y, &self.scale, self.eps);
+        mlxcel_core::reshape(&normed, &shape)
     }
 }
 

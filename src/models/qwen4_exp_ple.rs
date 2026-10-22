@@ -283,6 +283,14 @@ impl ShardedEmbedding {
                     "{weight_key} stores rows of width {width}, expected ple_embed_dim / n-gram heads = {row_width}"
                 ));
             }
+            // The packed width alone does not bound the sidecar gathers.
+            // Check scale/bias rows before the first embedding lookup.
+            shapes::expect_matrix(
+                weights,
+                &shard_prefix,
+                (group_size, bits),
+                &[expected_rows as usize, row_width],
+            )?;
             shards.push(UnifiedEmbedding::from_weights(
                 weights,
                 &shard_prefix,
@@ -489,7 +497,8 @@ impl PleLayer {
         let values = self.value_proj.forward(&embeddings);
         let queries = mlxcel_core::reshape(&self.norm_query.forward(hidden), &streams);
 
-        let gate = mlxcel_core::sum_axis(&mlxcel_core::multiply(&keys, &queries), -1, true);
+        let gate =
+            mlxcel_core::sum_axis_native_dtype(&mlxcel_core::multiply(&keys, &queries), -1, true);
         let gate = mlxcel_core::divide_scalar(&gate, (self.hidden_size as f32).sqrt());
         let floor = mlxcel_core::full_f32(&[1], 1e-6, mlxcel_core::array_dtype(&gate));
         let magnitude = mlxcel_core::sqrt(&mlxcel_core::maximum(&mlxcel_core::abs(&gate), &floor));

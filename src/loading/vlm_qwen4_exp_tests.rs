@@ -58,3 +58,40 @@ fn vision_features_must_match_the_text_width() {
         "{error}"
     );
 }
+
+#[test]
+fn optiq_folded_norms_restore_exact_scales_without_touching_gated_norms() {
+    use mlxcel_core::{dtype, utils::array_to_vec_f32};
+    for optiq in [false, true] {
+        let mut weights = WeightMap::new();
+        let norms = [
+            "model.layers.0.attn_hyper_connection.hc_norm.weight",
+            "model.layers.3.self_attn.q_norm.weight",
+            "model.layers.1.ple.norm_key.weight",
+            "model.layers.0.linear_attn.norm.weight",
+        ];
+        for name in norms {
+            weights.insert(
+                name.into(),
+                mlxcel_core::astype(
+                    &mlxcel_core::from_slice_f32(&[0.125, 1.0078125, 2.5], &[3]),
+                    dtype::BFLOAT16,
+                ),
+            );
+        }
+        let config = if optiq {
+            json!({"optiq_vision": {"sidecar": "optiq/vision.safetensors"}})
+        } else {
+            json!({})
+        };
+        super::restore_optiq_zero_centered_norms(&mut weights, &config);
+        for name in norms {
+            let expected = if optiq && !name.ends_with("linear_attn.norm.weight") {
+                vec![-0.875, 0.0078125, 1.5]
+            } else {
+                vec![0.125, 1.0078125, 2.5]
+            };
+            assert_eq!(array_to_vec_f32(&weights[name]), expected, "{name}");
+        }
+    }
+}

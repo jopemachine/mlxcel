@@ -38,6 +38,8 @@ pub mod config;
 mod gated_delta;
 #[path = "qwen4_exp_hyper.rs"]
 mod hyper;
+#[path = "qwen4_exp_linear.rs"]
+mod linear;
 #[path = "qwen4_exp_moe.rs"]
 mod moe;
 #[path = "qwen4_exp_norm.rs"]
@@ -229,7 +231,7 @@ impl Qwen4ExpModel {
                 weights, "lm_head", group_size, bits,
             )?)
         };
-        let mrope = InterleavedMRoPE::new(
+        let mrope = InterleavedMRoPE::new_with_backend_frequencies(
             config.rope_dims(),
             config.rope.rope_theta,
             config.rope.mrope_section.clone(),
@@ -325,7 +327,7 @@ impl Qwen4ExpModel {
             Some(positions) => mlxcel_core::astype(&positions, mlxcel_core::dtype::INT32),
             None => Self::text_positions(batch, seq_len, Self::cache_offset(caches)),
         };
-        let rope = RopeContext::new(&self.mrope, positions, mlxcel_core::array_dtype(&hidden));
+        let rope = RopeContext::new(&self.mrope, positions);
         let tokens = self
             .layers
             .iter()
@@ -334,6 +336,11 @@ impl Qwen4ExpModel {
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             hidden = layer.forward(hidden, tokens.as_deref(), cache, &rope);
+            if seq_len == 1 {
+                // Match mlx-vlm's decode scheduling: submit each layer while
+                // the CPU builds the next one instead of queuing the whole graph.
+                mlxcel_core::async_eval(&hidden);
+            }
         }
         self.hyper_connection_mixer.collapse(&hidden)
     }
@@ -427,6 +434,12 @@ impl Qwen4ExpModel {
         input_ids: &MlxArray,
         seq_ids: Option<&[SequenceId]>,
     ) -> UniquePtr<MlxArray> {
+        // Anonymous batches keep their row dimension in the fallback state.
+        // Splitting them into singleton calls would append every row to the
+        // same history, mixing KV, recurrent and PLE state across requests.
+        if seq_ids.is_none() {
+            return self.forward_sequence(input_ids, None, None);
+        }
         let shape = mlxcel_core::array_shape(input_ids);
         let mut result: Option<UniquePtr<MlxArray>> = None;
         for row in 0..shape[0] {
@@ -642,8 +655,8 @@ impl LanguageModel for Qwen4ExpModel {
         self.forward_sequence_last(input_ids, input_embeddings, seq_id, last_pos)
     }
 
-    /// Rows run one at a time against their own model-owned state, as
-    /// upstream builds every batched Qwen4-Exp prefill from singleton rows.
+    /// Identified rows run one at a time against their own model-owned state.
+    /// Anonymous rows stay together in the batched fallback state.
     fn forward_batched_with_ids(
         &self,
         input_ids: &MlxArray,

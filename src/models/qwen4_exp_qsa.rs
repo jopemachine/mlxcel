@@ -21,9 +21,8 @@
 //! selection covers its whole causal prefix, so attention stays dense until a
 //! query's prefix reaches `budget + compress_ratio` tokens.
 //!
-//! This is the graph form of upstream's `dispatch_qsa_attention`: the
-//! selection becomes a boolean mask for SDPA rather than an indexed Metal
-//! kernel.
+//! Metal uses upstream's indexed online-softmax kernel for prefill and
+//! sparse decode. Other backends retain the boolean-mask SDPA fallback.
 
 use mlxcel_core::cache::KVCache;
 use mlxcel_core::dtype;
@@ -42,22 +41,24 @@ use super::shapes;
 pub(crate) struct RopeContext<'a> {
     /// `[3, B, L]` int32 MRoPE positions.
     pub(crate) positions: UniquePtr<MlxArray>,
-    /// `[B, L, rope_dims]`, in the activation dtype.
+    /// `[B, L, rope_dims]` in float32, matching the fused upstream MRoPE kernel.
     pub(crate) cos: UniquePtr<MlxArray>,
     pub(crate) sin: UniquePtr<MlxArray>,
     pub(crate) mrope: &'a InterleavedMRoPE,
 }
 
 impl<'a> RopeContext<'a> {
-    pub(crate) fn new(
-        mrope: &'a InterleavedMRoPE,
-        positions: UniquePtr<MlxArray>,
-        activation_dtype: i32,
-    ) -> Self {
+    fn apply(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        self.mrope
+            .apply_metal(x, &self.positions)
+            .unwrap_or_else(|| apply_partial_rope(x, &self.cos, &self.sin))
+    }
+
+    pub(crate) fn new(mrope: &'a InterleavedMRoPE, positions: UniquePtr<MlxArray>) -> Self {
         let (cos, sin) = mrope.forward(&positions);
         Self {
-            cos: mlxcel_core::astype(&cos, activation_dtype),
-            sin: mlxcel_core::astype(&sin, activation_dtype),
+            cos,
+            sin,
             positions,
             mrope,
         }
@@ -81,6 +82,7 @@ pub(crate) fn apply_partial_rope(
     let mut stop = shape.clone();
     stop[3] = rotary;
     let x_rot = mlxcel_core::slice(x, &[0, 0, 0, 0], &stop);
+    let x_rot = mlxcel_core::astype(&x_rot, dtype::FLOAT32);
     let rotated = mlxcel_core::add(
         &mlxcel_core::multiply(&x_rot, &cos),
         &mlxcel_core::multiply(&rotate_half(&x_rot), &sin),
@@ -228,7 +230,7 @@ impl QsaIndexer {
         );
         let query = self.q_layernorm.forward(&query);
         let query = mlxcel_core::transpose_axes(&query, &[0, 2, 1, 3]);
-        let query = apply_partial_rope(&query, &rope.cos, &rope.sin);
+        let query = rope.apply(&query);
 
         let pooled = self.block_keys(cache, batch, max_complete_blocks, rope.mrope);
         let scores = mlxcel_core::matmul(
@@ -323,9 +325,9 @@ impl QsaIndexer {
             2,
         );
         let (cos, sin) = mrope.forward(&block_positions);
-        let cos = mlxcel_core::astype(&cos, raw_dtype);
-        let sin = mlxcel_core::astype(&sin, raw_dtype);
-        let pooled = apply_partial_rope(&pooled, &cos, &sin);
+        let pooled = mrope
+            .apply_metal(&pooled, &block_positions)
+            .unwrap_or_else(|| apply_partial_rope(&pooled, &cos, &sin));
         let pooled = match cache.block_keys.take() {
             Some(previous) if first_new > 0 => concatenate(&previous, &pooled, 2),
             _ => pooled,
@@ -488,28 +490,78 @@ impl QsaAttention {
         let queries = mlxcel_core::transpose_axes(&self.q_norm.forward(&queries), &[0, 2, 1, 3]);
         let keys = mlxcel_core::transpose_axes(&self.k_norm.forward(&keys), &[0, 2, 1, 3]);
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
-        let queries = apply_partial_rope(&queries, &rope.cos, &rope.sin);
-        let keys = apply_partial_rope(&keys, &rope.cos, &rope.sin);
+        let queries = rope.apply(&queries);
+        let keys = rope.apply(&keys);
 
         let (keys, values) = kv.update_and_fetch(keys, values);
-        let mask = selection
-            .as_ref()
-            .map(|selection| self.indexer.build_mask(selection));
-        let output = match mask {
-            Some(mask) => mlxcel_core::layers::attention(
+
+        let sparse = (l > 1 || selection.is_some())
+            && mlxcel_core::metal_is_available()
+            && mlxcel_core::default_device_is_gpu()
+            && matches!(
+                mlxcel_core::array_dtype(&queries),
+                dtype::FLOAT16 | dtype::BFLOAT16
+            )
+            && self.head_dim % 32 == 0
+            && self.indexer.compress_ratio <= 32
+            && mlxcel_core::array_dtype(&keys) == mlxcel_core::array_dtype(&queries)
+            && mlxcel_core::array_dtype(&values) == mlxcel_core::array_dtype(&queries);
+        let output = if sparse {
+            let ends: Vec<i32> = (index.len() - l + 1..=index.len()).collect();
+            let ends = mlxcel_core::from_slice_i32(&ends, &[1, l]);
+            let ends = mlxcel_core::broadcast_to(&ends, &[b, l]);
+            let blocks = match selection.as_ref() {
+                Some(selection) => mlxcel_core::copy(&selection.selected),
+                None => {
+                    // The reference pads short prefixes to the same block budget,
+                    // retaining one reduction geometry throughout causal prefill.
+                    let ids = mlxcel_core::arange_i32(0, self.indexer.block_topk, 1);
+                    let ids = mlxcel_core::reshape(&ids, &[1, 1, self.indexer.block_topk]);
+                    let counts = mlxcel_core::floor_divide(
+                        &ends,
+                        &mlxcel_core::full_f32(
+                            &[1],
+                            self.indexer.compress_ratio as f32,
+                            dtype::INT32,
+                        ),
+                    );
+                    let valid = mlxcel_core::less(&ids, &mlxcel_core::expand_dims(&counts, -1));
+                    mlxcel_core::where_cond(
+                        &valid,
+                        &ids,
+                        &mlxcel_core::full_f32(&[1], -1.0, dtype::INT32),
+                    )
+                }
+            };
+            mlxcel_core::qwen4_qsa_attention(
                 &queries,
                 &keys,
                 &values,
+                &blocks,
+                &ends,
                 self.scale,
-                Some(&mask),
-                0.0,
-                0,
-            ),
-            None if l > 1 => {
-                mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
-            }
-            None => {
-                mlxcel_core::layers::attention(&queries, &keys, &values, self.scale, None, 0.0, 0)
+                self.indexer.compress_ratio,
+            )
+        } else {
+            let mask = selection
+                .as_ref()
+                .map(|selection| self.indexer.build_mask(selection));
+            match mask {
+                Some(mask) => mlxcel_core::layers::attention(
+                    &queries,
+                    &keys,
+                    &values,
+                    self.scale,
+                    Some(&mask),
+                    0.0,
+                    0,
+                ),
+                None if l > 1 => {
+                    mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
+                }
+                None => mlxcel_core::layers::attention(
+                    &queries, &keys, &values, self.scale, None, 0.0, 0,
+                ),
             }
         };
         let output = mlxcel_core::reshape(
