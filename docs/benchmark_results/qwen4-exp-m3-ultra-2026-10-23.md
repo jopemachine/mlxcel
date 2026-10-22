@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next on M3 Ultra — 2026-10-23
 
-This run qualifies PR #2475 against the OptiQ 2-bit checkpoint and the updated mlx-vlm reference. Both runtimes keep the model resident; SSD expert streaming is not used.
+This run qualifies PR #2475 against the OptiQ 2-bit checkpoint and the updated mlx-vlm reference. Both runtimes keep the text backbone resident; SSD expert streaming is not used.
 
 ## Environment and checkpoint
 
@@ -41,7 +41,7 @@ For the dense reference add `--indexer-budget 8192`; use the matching config ove
 
 ## Performance methodology
 
-`examples/qwen4_exp_benchmark.rs` and `scripts/qwen4_exp_benchmark.py` run the same token IDs with batch size one and fresh cache state per repetition. One complete warmup precedes measured runs. Prefill is one forward call; decode performs 128 synchronous, teacher-forced singleton calls, including argmax evaluation and token readback. Both keep the vision tower resident. Model loading, tokenization and HTTP overhead are excluded. GPU jobs run serially.
+`examples/qwen4_exp_benchmark.rs` and `scripts/qwen4_exp_benchmark.py` run the same token IDs with batch size one and fresh cache state per repetition. One complete warmup precedes measured runs. Prefill is one forward call; decode performs 128 synchronous, teacher-forced singleton calls, including argmax evaluation and token readback. Unused vision allocations are excluded: mlxcel leaves the tower lazy, and the Python harness releases the wrapper while retaining its language model. Model loading, tokenization and HTTP overhead are excluded. GPU jobs run serially.
 
 ```sh
 cargo build --release --features metal,accelerate --bin mlxcel --example qwen4_exp_benchmark --example logit_trace
@@ -59,12 +59,12 @@ Median of five measured runs; the full warmup row is retained in each raw JSONL 
 
 | Prompt tokens | Runtime | Prefill tok/s | Decode tok/s | Decode range | Peak GB |
 |---:|---|---:|---:|---:|---:|
-| 128 | [reference](qwen4-exp-2026-10-23/reference-128.jsonl) | 418.14 | 40.82 | 40.76–40.84 | 82.19 |
-| 128 | [mlxcel](qwen4-exp-2026-10-23/mlxcel-128.jsonl) | 434.17 | 41.33 | 39.94–41.34 | 81.27 |
-| 4,608 | [reference](qwen4-exp-2026-10-23/reference-4608.jsonl) | 1008.66 | 31.82 | 30.80–32.11 | 88.98 |
-| 4,608 | [mlxcel](qwen4-exp-2026-10-23/mlxcel-4608.jsonl) | 1056.69 | 37.73 | 37.70–37.77 | 87.92 |
+| 128 | [reference](qwen4-exp-2026-10-23/reference-128.jsonl) | 418.00 | 40.84 | 40.78–40.88 | 81.29 |
+| 128 | [mlxcel](qwen4-exp-2026-10-23/mlxcel-128.jsonl) | 434.02 | 41.39 | 40.60–41.41 | 81.27 |
+| 4,608 | [reference](qwen4-exp-2026-10-23/reference-4608.jsonl) | 1006.52 | 32.00 | 31.02–32.21 | 88.08 |
+| 4,608 | [mlxcel](qwen4-exp-2026-10-23/mlxcel-4608.jsonl) | 1056.91 | 37.77 | 36.89–37.79 | 87.92 |
 
-All 128 decode predictions agree in every paired run, including warmup. Median prefill improves by 3.84% at 128 tokens and 4.76% at 4,608 tokens; median decode improves by 1.23% and 18.57%, respectively. The short-decode difference is small relative to the observed run-to-run spread and should be treated as near parity, not a broad speedup claim. These results qualify this checkpoint and M3 Ultra configuration; they do not establish performance on other models, quantizations or hardware.
+All 128 decode predictions agree in every paired run, including warmup. Median prefill improves by 3.83% at 128 tokens and 5.01% at 4,608 tokens; median decode improves by 1.35% and 18.02%, respectively. The short-decode difference is small relative to the observed run-to-run spread and should be treated as near parity, not a broad speedup claim. These results qualify this checkpoint and M3 Ultra configuration; they do not establish performance on other models, quantizations or hardware.
 
 The numerical trace files are [reference sparse](qwen4-exp-2026-10-23/reference-sparse.tsv), [mlxcel sparse](qwen4-exp-2026-10-23/mlxcel-sparse.tsv), [reference dense](qwen4-exp-2026-10-23/reference-dense.tsv), and [mlxcel dense](qwen4-exp-2026-10-23/mlxcel-dense.tsv).
 
@@ -99,6 +99,7 @@ Image and video answers reached the requested token cap; they are not presented 
 - `cargo test --workspace --profile test-fast --features metal,accelerate --no-fail-fast -- --test-threads=1`: 13,308 passed, 0 failed, 404 ignored.
 - `cargo clippy --workspace --all-targets --features metal,accelerate -- -D warnings`: passed.
 - `cargo fmt --all --check`, license-header, kernel dtype-key and kernel port-dispatch checks: passed.
+- Python 3.12 `unittest discover -s tests -p 'test_*.py' -v`: 139 tests, no failures, 28 platform skips on macOS. The script executable-mode CI failure was corrected and verified by this run.
 - Added bf16 MoE and long-position rotary fixtures, float32 recurrent-state/chunking checks, anonymous-batch isolation, malformed PLE sidecar rejection, folded OptiQ norm tests, fused projection equivalence and sparse singleton attention coverage.
 
 External PLE storage, FP8 checkpoints, MTP/DFlash, adapters, tensor/pipeline parallelism, padded or scheduled batched prefill, paged decoding, prompt-cache snapshots and KV-cache quantization remain outside this port's supported scope. Other model families retain their existing recurrent-kernel dtype behavior; Qwen4 opts into float32 gate/state preservation.

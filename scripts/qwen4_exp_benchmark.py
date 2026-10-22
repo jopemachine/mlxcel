@@ -27,8 +27,9 @@ def main():
     tokenizer = load_tokenizer(Path(model_path))
     ids = tokenizer.encode(Path(corpus).read_text(), add_special_tokens=False).ids
     assert len(ids) >= prefill + decode
-    loaded = load_reference(Path(model_path))
-    model = loaded.language_model  # Keep the vision tower resident, as mlxcel does.
+    # mlxcel leaves unused vision weights lazy. Drop the reference wrapper
+    # so this text-only benchmark likewise excludes active vision allocations.
+    model = load_reference(Path(model_path)).language_model
     for run in range(repeats + 1):
         cache = model.make_cache()
         mx.synchronize()
