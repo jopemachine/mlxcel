@@ -178,6 +178,12 @@ mod ffi {
         /// Get the shape of an array
         fn array_shape(arr: &MlxArray) -> Vec<i32>;
 
+        /// Get the strides of an array, in elements. MLX ignores the stride
+        /// of a size-1 axis when it classifies an array as row-contiguous,
+        /// so that stride can be anything; kernels that read it as a leading
+        /// dimension must not (issue #2462).
+        fn array_strides(arr: &MlxArray) -> Vec<i64>;
+
         /// Get the dtype of an array (as integer code)
         fn array_dtype(arr: &MlxArray) -> i32;
 
@@ -225,12 +231,14 @@ mod ffi {
         /// independent error so tests can exercise consuming read boundaries.
         fn array_with_failed_event_for_test() -> UniquePtr<MlxArray>;
 
-        /// Test-only (issue #1792). Run fixed graph `graph` on `(a, b)`
-        /// eagerly (`mode` 0), through `mlx::core::compile` (1), or through
-        /// a shapeless compile (2), and return the evaluated output. The
-        /// graphs (comparisons, `isnan` / `isinf`, the min-p filter, mixed
-        /// bf16/f32 arithmetic) are listed in `compiled_dtype_cast_tests.rs`.
-        /// Errors on an unknown graph or mode.
+        /// Test-only (issues #1792, #2333). Run fixed graph `graph` on
+        /// `(a, b)` eagerly (`mode` 0), through `mlx::core::compile` (1), or
+        /// through a shapeless compile (2), and return the evaluated output.
+        /// The graphs (comparisons, `isnan` / `isinf`, the min-p filter,
+        /// mixed bf16/f32 arithmetic, and `real` / `imag` of a complex64
+        /// `a + i*b` built in the graph or passed in as a complex64 input)
+        /// are listed in `compiled_dtype_cast_tests.rs`. Errors on an unknown
+        /// graph or mode.
         fn compile_dtype_probe_for_test(
             graph: i32,
             a: &MlxArray,
@@ -1403,8 +1411,8 @@ mod ffi {
             mask: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-        /// Fast SDPA with optional sinks (per-head attention bias for first position)
-        /// Used by: GptOss
+        /// Fast SDPA with optional attention sinks: an extra per-head logit added to the softmax denominator, with no value row
+        /// Used by: GptOss, Laguna, DeepSeekV4, FalconOcr, OpenAIPrivacyFilter
         #[allow(clippy::too_many_arguments)]
         unsafe fn fast_scaled_dot_product_attention_with_sinks(
             q: &MlxArray,
@@ -1627,6 +1635,25 @@ mod ffi {
         /// Whether two handles refer to the same MLX array node.
         fn array_same_handle(a: &MlxArray, b: &MlxArray) -> bool;
 
+        /// Opaque weak reference to an MLX array node (#1564).
+        type MlxWeakArray;
+
+        /// A weak reference to `a`'s node, which keeps neither the node nor
+        /// its buffer alive. The weight materialization scope (#1564) holds
+        /// these, so a checkpoint tensor a loader evaluated and dropped during
+        /// the load is freed at once.
+        fn array_weak_ref(a: &MlxArray) -> UniquePtr<MlxWeakArray>;
+
+        /// A handle to the node if any handle, or the input list of any lazy
+        /// array, still holds it; null otherwise.
+        fn array_weak_upgrade(w: &MlxWeakArray) -> UniquePtr<MlxArray>;
+
+        /// Fill `out` with the CUDA weight-upload counters of
+        /// `Load::eval_gpu` (#1564), in the field order of
+        /// `mlx::core::cu::LoadTransferStats`. Returns false, leaving `out`
+        /// untouched, on a build without the CUDA backend.
+        fn weight_load_transfer_stats(out: &mut [u64]) -> bool;
+
         /// `dst` with `rows` written at `start`, sharing `dst`'s buffer
         /// instead of copying it (#1959). Sound only when no reader of `dst`
         /// needs the written region's old contents and the caller owns the
@@ -1830,6 +1857,74 @@ mod ffi {
             indices_out: &mut UniquePtr<MlxArray>,
             scores_out: &mut UniquePtr<MlxArray>,
         );
+
+        // Whole post-matmul Inkling MoE routing chain as one Metal kernel
+        // (issue #2479): sigmoid + correction bias + top-k + logsigmoid
+        // softmax + scaling, emitting the shared-expert weights
+        // pre-broadcast. Matches mlx-vlm inkling_moe_route.
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the
+        /// process on a C++ throw across a `noexcept` extern (issues #1885,
+        /// #1801). Production gates on `inkling_moe_kernels_available` and
+        /// falls back to the graph routing chain on `Err`, so a truthful
+        /// gate never sees the refusal except through a direct call.
+        fn inkling_moe_route_kernel(
+            logits: &MlxArray,
+            corr: &MlxArray,
+            wscale: &MlxArray,
+            n_routed: i32,
+            n_shared: i32,
+            top_k: i32,
+            intermediate: i32,
+            indices_out: &mut UniquePtr<MlxArray>,
+            weights_out: &mut UniquePtr<MlxArray>,
+            gamma_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
+
+        // Weighted routed-expert down-projection for decode as one Metal
+        // kernel (issue #2479): in-kernel q4/g64 row dequant with the top-k
+        // weighted expert sum folded in. The caller's gate pins bits=4,
+        // group_size=64, affine with biases, and in_dims 2048. Matches
+        // mlx-vlm inkling_moe_down_combine.
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the
+        /// process on a C++ throw across a `noexcept` extern (issues #1885,
+        /// #1801). Production gates on `inkling_moe_kernels_available` and
+        /// falls back to the gather path on `Err`, so a truthful gate never
+        /// sees the refusal except through a direct call.
+        unsafe fn inkling_moe_down_combine_kernel(
+            act: &MlxArray,
+            wq: &MlxArray,
+            sc: &MlxArray,
+            bi: &MlxArray,
+            idx: &MlxArray,
+            wk: &MlxArray,
+            top_k: i32,
+            out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
+
+        // Selected gate/up projection for affine q4 switch experts as one
+        // Metal kernel: in-kernel q4/g64 dequant over both planes' packed
+        // weights. The caller's gate pins bits=4, affine with biases, equal
+        // plane shapes, scales/biases in the activation dtype, and
+        // k_size % 512 == 0 / n_size % 8 == 0. Matches mlx-vlm
+        // short_block_affine4_switch_gate_up.
+        fn moe_switch_gate_up_kernel(
+            x: &MlxArray,
+            idx: &MlxArray,
+            up_w: &MlxArray,
+            up_scales: &MlxArray,
+            up_biases: &MlxArray,
+            gate_w: &MlxArray,
+            gate_scales: &MlxArray,
+            gate_biases: &MlxArray,
+            top_k: i32,
+            group_size: i32,
+            up_out: &mut UniquePtr<MlxArray>,
+            gate_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
 
         // Fused MoE forward: gate + switch_mlp + score weighting + shared expert
         /// Combines ~25 FFI calls into a single C++ function
@@ -3555,8 +3650,10 @@ pub use lang_analyzer::cache_root;
 /// (`$TMPDIR/mlx/<version>/ptx`), which is cleared on reboot, so the first-run
 /// kernel compilation is paid again every boot. A persistent location pays it
 /// once per machine. The directory is scoped by the pinned MLX commit because
-/// the cache is keyed only by kernel name and is not validated against the
-/// kernel source, so entries must not survive an MLX upgrade. No-op on non-CUDA
+/// built-in kernels are keyed by kernel name alone and are not validated
+/// against the kernel source, so those entries must not survive an MLX upgrade.
+/// Custom kernels (`mx.fast.cuda_kernel`) are keyed by name, template arguments
+/// and a hash of the full source. No-op on non-CUDA
 /// builds, when `MLX_PTX_CACHE_DIR` is already set, and when the cache root
 /// cannot be resolved. Call once at startup before the first inference.
 pub fn ensure_persistent_ptx_cache() {
@@ -3930,6 +4027,13 @@ pub mod utils;
 
 // Weight loading utilities
 pub mod weights;
+
+// When checkpoint weights are read and uploaded: at model load or at the first
+// token (#1564).
+pub mod weight_materialize;
+#[cfg(test)]
+#[path = "weight_materialize_tests.rs"]
+mod weight_materialize_tests;
 
 // Token generation
 pub mod generate;

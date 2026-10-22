@@ -217,6 +217,7 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
 
 // Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr);
+rust::Vec<int64_t> array_strides(const MlxArray& arr);
 int32_t array_dtype(const MlxArray& arr);
 size_t array_size(const MlxArray& arr);
 size_t array_ndim(const MlxArray& arr);
@@ -253,9 +254,12 @@ rust::Vec<uint8_t> array_evaluated_bytes(const MlxArray& arr);
 // synthetic backend error. The error outlives the returned event.
 std::unique_ptr<MlxArray> array_with_failed_event_for_test();
 
-// Test-only (issue #1792), in mlx_cxx_compile_probe.cpp. Run fixed graph
-// `graph` on (a, b) eagerly (mode 0), compiled (1) or compiled shapeless (2),
-// and return the evaluated output.
+// Test-only (issues #1792, #2333), in mlx_cxx_compile_probe.cpp. Run fixed
+// graph `graph` on (a, b) eagerly (mode 0), compiled (1) or compiled
+// shapeless (2), and return the evaluated output. Graphs 0-6 cover
+// comparisons, isnan / isinf, the min-p filter and mixed bf16/f32
+// arithmetic; graphs 7-10 take real / imag of the complex64 a + i*b, built
+// in the graph (7, 8) or passed in as an eagerly built input (9, 10).
 std::unique_ptr<MlxArray> compile_dtype_probe_for_test(
     int32_t graph,
     const MlxArray& a,
@@ -1135,8 +1139,8 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
     const MlxArray* mask  // nullable
 );
 
-// Fast SDPA with optional sinks (per-head attention bias for first position)
-// Used by: GptOss
+// Fast SDPA with optional attention sinks: an extra per-head logit added to the softmax denominator, with no value row
+// Used by: GptOss, Laguna, DeepSeekV4, FalconOcr, OpenAIPrivacyFilter
 std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     const MlxArray& q,
     const MlxArray& k,
@@ -2089,6 +2093,66 @@ void compiled_moe_gate(
     std::unique_ptr<MlxArray>& scores_out
 );
 
+// Whole post-matmul Inkling MoE routing chain as one Metal kernel (issue
+// #2479): sigmoid + correction bias + top-k + logsigmoid/logsumexp softmax +
+// scaling, emitting the shared-expert weights pre-broadcast over the
+// expert-major dense intermediate. Matches mlx-vlm inkling_moe_route.
+// Declared `-> Result<()>` in the bridge so cxx catches the launcher's
+// no-port refusal (issues #1885, #1801) and any thrown MLX exception at the
+// FFI boundary instead of aborting.
+void inkling_moe_route_kernel(
+    const MlxArray& logits,        // [tokens, n_routed + n_shared]
+    const MlxArray& corr,          // [n_routed] float32
+    const MlxArray& wscale,        // [1] float32 = route_scale * global_scale
+    int32_t n_routed,
+    int32_t n_shared,
+    int32_t top_k,
+    int32_t intermediate,
+    std::unique_ptr<MlxArray>& indices_out,  // [tokens, top_k] uint32
+    std::unique_ptr<MlxArray>& weights_out,  // [tokens, top_k]
+    std::unique_ptr<MlxArray>& gamma_out     // [tokens, n_shared * intermediate]
+);
+
+// Weighted routed-expert down-projection for decode as one Metal kernel
+// (issue #2479): in-kernel q4/g64 row dequant with the top-k weighted expert
+// sum folded in, so the [N, K, out] intermediate never exists. The caller's
+// gate pins bits=4, group_size=64, affine with biases, and in_dims 2048.
+// Matches mlx-vlm inkling_moe_down_combine.
+// Declared `-> Result<()>` in the bridge so cxx catches the launcher's
+// no-port refusal (issues #1885, #1801) and any thrown MLX exception at the
+// FFI boundary instead of aborting.
+void inkling_moe_down_combine_kernel(
+    const MlxArray& act,           // [tokens * top_k, in_dims] contiguous
+    const MlxArray& wq,            // [experts, out_dims, in_dims/8] uint32
+    const MlxArray& sc,            // [experts, out_dims, groups]
+    const MlxArray& bi,            // [experts, out_dims, groups]
+    const MlxArray& idx,           // [tokens, top_k] uint32
+    const MlxArray& wk,            // [tokens, top_k]
+    int32_t top_k,
+    std::unique_ptr<MlxArray>& out  // [tokens, out_dims]
+);
+
+// Selected gate/up projection for affine q4 switch experts as one Metal
+// kernel: in-kernel q4/g64 dequant over both planes' packed weights, so the
+// two indexed gather_qmm dispatches never run. The caller's gate pins
+// bits=4, affine with biases, equal plane shapes, scales/biases in the
+// activation dtype, and k_size % 512 == 0 / n_size % 8 == 0. Matches
+// mlx-vlm short_block_affine4_switch_gate_up.
+void moe_switch_gate_up_kernel(
+    const MlxArray& x,             // [tokens, k_size] contiguous
+    const MlxArray& idx,           // [tokens, top_k] uint32 contiguous
+    const MlxArray& up_w,          // [experts, n_size, k_size/8] uint32
+    const MlxArray& up_scales,     // [experts, n_size, groups] x dtype
+    const MlxArray& up_biases,     // [experts, n_size, groups] x dtype
+    const MlxArray& gate_w,        // same shape as up_w
+    const MlxArray& gate_scales,
+    const MlxArray& gate_biases,
+    int32_t top_k,
+    int32_t group_size,
+    std::unique_ptr<MlxArray>& up_out,   // [tokens, top_k, n_size]
+    std::unique_ptr<MlxArray>& gate_out  // [tokens, top_k, n_size]
+);
+
 // Fused Mamba2 mixer forward for single-token decode.
 // Replaces ~23 FFI calls with a single C++ function call.
 // Used by: NemotronH (and any other model with quantized Mamba2Mixer).
@@ -2622,6 +2686,22 @@ std::unique_ptr<MlxArray> array_handle_clone(const MlxArray& a);
 
 // Whether two handles refer to the same MLX array node.
 bool array_same_handle(const MlxArray& a, const MlxArray& b);
+
+// A weak reference to an MLX array node (#1564): it does not keep the node or
+// its buffer alive. The pointee is `mlx::core::array::ArrayDesc`, private to
+// MLX, so it is held type-erased.
+struct MlxWeakArray {
+    std::weak_ptr<void> desc;
+};
+
+// A weak reference to `a`'s node.
+std::unique_ptr<MlxWeakArray> array_weak_ref(const MlxArray& a);
+
+// A handle to the node if something still holds it, null otherwise.
+std::unique_ptr<MlxArray> array_weak_upgrade(const MlxWeakArray& w);
+
+// CUDA weight-upload counters of `Load::eval_gpu` (#1564); false without CUDA.
+bool weight_load_transfer_stats(rust::Slice<uint64_t> out);
 
 std::unique_ptr<MlxArray> inplace_slice_write(
     const MlxArray& dst,

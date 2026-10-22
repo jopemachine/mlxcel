@@ -617,6 +617,14 @@ rust::Vec<int32_t> array_shape(const MlxArray& arr) {
     return result;
 }
 
+rust::Vec<int64_t> array_strides(const MlxArray& arr) {
+    rust::Vec<int64_t> result;
+    for (auto s : arr.inner.strides()) {
+        result.push_back(s);
+    }
+    return result;
+}
+
 int32_t array_dtype(const MlxArray& arr) {
     return from_dtype(arr.inner.dtype());
 }
@@ -4115,8 +4123,8 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
     ));
 }
 
-// Fast SDPA with optional sinks (per-head attention bias for first position)
-// Used by: GptOss
+// Fast SDPA with optional attention sinks: an extra per-head logit added to the softmax denominator, with no value row
+// Used by: GptOss, Laguna, DeepSeekV4, FalconOcr, OpenAIPrivacyFilter
 std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     const MlxArray& q,
     const MlxArray& k,

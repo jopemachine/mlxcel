@@ -44,7 +44,7 @@ use crate::server::types::request::Tool;
 /// Shared by [`strip_thinking`], which removes them, and
 /// [`thinking_marker_pair`], which reports which one a generation used, so the
 /// two cannot disagree about what delimits a thinking block.
-const THINKING_MARKER_PAIRS: [(&str, &str); 4] = [
+pub(super) const THINKING_MARKER_PAIRS: [(&str, &str); 5] = [
     ("<think>", "</think>"),
     ("<|content_thinking|>", "<|end_message|>"),
     ("<|channel>", "<channel|>"),
@@ -52,6 +52,8 @@ const THINKING_MARKER_PAIRS: [(&str, &str); 4] = [
     // generation prompt ends with the open tag, so the model emits only the
     // close.
     ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+    // Kimi-VL-Thinking (#2464): `◁think▷...◁/think▷` ahead of the answer.
+    ("◁think▷", "◁/think▷"),
 ];
 
 fn has_inkling_primed_boundary(text: &str) -> bool {
@@ -126,7 +128,16 @@ fn clean_content_markers(text: &str) -> String {
     // The streaming filter suppresses it in every one of those cases, so the
     // non-streamed content drops it too instead of echoing call syntax (#2394,
     // the #1743 rule).
+    // MiniMax M3: a namespaced block `try_minimax_m3` did not turn into a call
+    // (no-tools request, unknown function). Dropped before the Hermes pass,
+    // which would otherwise keep the `]<]minimax[>[` token in front of the
+    // embedded `<tool_call>` as content (#2464).
+    let text = strip_blocks(&text, MINIMAX_M3_TOOL_OPEN, MINIMAX_M3_TOOL_CLOSE);
     let text = strip_hermes_tool_blocks(&text);
+    // Llama 3.x: a `<|python_tag|>` call `try_llama3` did not parse (no-tools
+    // request, unknown function, malformed JSON), dropped for the same reason
+    // as the Hermes block above (#2470).
+    let text = strip_python_tag_blocks(&text);
     text.replace("<turn|>", "")
         .replace("<|turn>", "")
         .replace("<|think|>", "")
@@ -176,26 +187,41 @@ pub fn strip_answer_wrapper(content: &str) -> String {
     out.trim().to_string()
 }
 
-/// Drop every Hermes `<tool_call>...</tool_call>` block, and an unclosed one
-/// through the end of the text, plus any stray close tag.
-fn strip_hermes_tool_blocks(text: &str) -> String {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
-    if !text.contains(OPEN) && !text.contains(CLOSE) {
+/// MiniMax M3's namespaced tool-call block tags; the streaming
+/// `CHAT_DELIMITERS` table carries the same two rows.
+const MINIMAX_M3_TOOL_OPEN: &str = "]<]minimax[>[<tool_call>";
+const MINIMAX_M3_TOOL_CLOSE: &str = "]<]minimax[>[</tool_call>";
+
+/// Drop every `open...close` block, and an unclosed one through the end of the
+/// text, plus any stray `close`.
+fn strip_blocks(text: &str, open: &str, close: &str) -> String {
+    if !text.contains(open) && !text.contains(close) {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(OPEN) {
+    while let Some(start) = rest.find(open) {
         out.push_str(&rest[..start]);
-        let after = &rest[start + OPEN.len()..];
-        rest = match after.find(CLOSE) {
-            Some(end) => &after[end + CLOSE.len()..],
+        let after = &rest[start + open.len()..];
+        rest = match after.find(close) {
+            Some(end) => &after[end + close.len()..],
             None => "",
         };
     }
     out.push_str(rest);
-    out.replace(CLOSE, "")
+    out.replace(close, "")
+}
+
+/// Drop every Hermes `<tool_call>...</tool_call>` block, and an unclosed one
+/// through the end of the text, plus any stray close tag.
+fn strip_hermes_tool_blocks(text: &str) -> String {
+    strip_blocks(text, "<tool_call>", "</tool_call>")
+}
+
+/// Drop every Llama 3.x `<|python_tag|>` call through its `<|eom_id|>` close,
+/// or through the end of the text when unclosed, plus any stray close.
+fn strip_python_tag_blocks(text: &str) -> String {
+    strip_blocks(text, "<|python_tag|>", "<|eom_id|>")
 }
 
 /// Strip all known structural tokens (thinking blocks and stray turn/think
@@ -501,25 +527,26 @@ fn filter_by_tools(calls: Vec<ParsedToolCall>, tools: &[Tool]) -> Vec<ParsedTool
     calls
         .into_iter()
         .filter_map(|mut c| {
-            if tool_names.contains(c.name.as_str()) {
-                // Bare name matches directly.
-                Some(c)
-            } else if let Some(dot_pos) = c.name.find('.') {
-                // Strip the leading namespace segment (e.g. `functions.`) and
-                // retry. Only normalise when the result actually matches a
-                // registered tool; otherwise drop the call as before.
-                let stripped = c.name[dot_pos + 1..].to_string();
-                if tool_names.contains(stripped.as_str()) {
-                    c.name = stripped;
-                    Some(c)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            c.name = resolve_tool_name(&c.name, &tool_names)?.to_string();
+            Some(c)
         })
         .collect()
+}
+
+/// The name [`filter_by_tools`] keeps a call under, or `None` when it drops
+/// the call. A bare name that matches a registered tool is kept; otherwise
+/// the leading namespace segment (e.g. `functions.`) is stripped and the rest
+/// kept when it matches. Shared with the incremental streamer (#2396) so a
+/// streamed call carries the name the final parse reports.
+pub(super) fn resolve_tool_name<'a>(
+    name: &'a str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<&'a str> {
+    if tool_names.contains(name) {
+        return Some(name);
+    }
+    let (_, stripped) = name.split_once('.')?;
+    tool_names.contains(stripped).then_some(stripped)
 }
 
 /// Generate a unique tool call ID in the format `call_` + random alphanumeric.

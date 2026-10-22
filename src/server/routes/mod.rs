@@ -33,6 +33,7 @@ pub mod detokenize;
 pub mod embeddings;
 pub mod feature_disabled;
 pub mod health;
+pub mod images;
 pub mod infill;
 pub mod lora_adapters;
 pub mod metrics;
@@ -44,10 +45,14 @@ pub mod props;
 pub mod realtime;
 pub mod rerank;
 pub mod responses;
+mod responses_auto_compact;
+pub mod responses_compact;
+mod responses_compact_media;
 pub mod settings;
 pub mod slots;
 pub mod stream;
 pub mod tokenize;
+pub(crate) mod tool_call_stream;
 pub mod transcription_compat;
 
 #[cfg(test)]
@@ -80,6 +85,7 @@ pub use detokenize::detokenize;
 pub use embeddings::{create_embeddings, native_embeddings};
 pub use feature_disabled::feature_disabled;
 pub use health::health_check;
+pub use images::{create_image_edit, create_image_generation};
 pub use infill::infill;
 pub use lora_adapters::{get_lora_adapters, post_lora_adapters};
 pub use metrics::metrics;
@@ -90,6 +96,7 @@ pub use prompt_inspection::{apply_template, chat_input_tokens, responses_input_t
 pub use props::{post_props, props};
 pub use rerank::create_rerank;
 pub use responses::{cancel_response, create_response, delete_response, retrieve_response};
+pub use responses_compact::compact_response;
 pub use settings::{get_settings, patch_settings};
 pub use slots::{slot_action, slots};
 pub use stream::{stream_delete, stream_get, streams_lookup};

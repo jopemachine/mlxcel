@@ -14,9 +14,10 @@ Apple Silicon is the primary target. Linux/CUDA is supported as a secondary targ
 
 ## Current main highlights
 
-The current `main` branch is v0.7.0 plus unreleased work. Install from source to use features that have not reached the latest tagged release; see the [changelog](CHANGELOG.md) for the release-by-release record.
+The current `main` branch is v0.8.0-beta.1 plus unreleased work. Install from source to use features that have not reached the latest tagged release; see the [changelog](CHANGELOG.md) for the release-by-release record.
 
 - **Experimental AMD GPU (ROCm) support.** `--features rocm` builds mlxcel on Linux against an MLX ROCm backend vendored into the source tree as the ROCm part of mlxcelverse, applied on the same pinned MLX commit as the Metal and CUDA builds. Affine, mxfp8, and mxfp4 checkpoints, including gpt-oss MoE experts, run on RDNA 3.5 (`gfx1151`); the fused kernels with a HIP port (BitLinear, the samplers, the SSM update step, the Mamba1 scan, the decode-MoE kernels, xIELU, the add3 LayerNorm, and the fused add-RMSNorm and RoPE + append, which are on by default on ROCm) run natively and the rest fall back to MLX graphs. See [Linux with AMD ROCm](docs/installation.md#linux-with-amd-rocm-experimental) for the build and the open gaps.
+- **Bundled WebUI.** `--webui` serves a browser interface from `mlxcel serve` or `mlxcel-server`: a model library with download, load, unload, and delete; local streaming chat; runtime activity; and scoped settings with next-load profiles. See the [WebUI guide](docs/webui/README.md).
 - **Verified `llama-server` compatibility.** A frozen b10621 manifest classifies all 376 pinned options, routes, and native request fields, with no deferred entries. Native completion, embedding, tokenization, template, infill, props, slots, metrics, resumable-stream, router, and LoRA surfaces are implemented or explicitly classified instead of being silently ignored.
 - **OpenAI, Anthropic, and Vertex-compatible serving.** Chat Completions, Completions, Responses, Embeddings, Reranking, Audio, and Anthropic Messages are available alongside the native `llama-server` routes. Optional Vertex AI custom-container routing is supported through the standard `AIP_*` variables.
 - **Multi-model routing and live adapters.** Router mode discovers checkpoints from the model store, a model directory, or INI presets; loads them on demand; and bounds the resident set with LRU eviction. Multiple LoRA adapters can remain unfused for per-request or live scale changes, or be fused for zero decode overhead.
@@ -227,6 +228,10 @@ mlxcel rm mlx-community/Qwen3.5-0.8B-4bit --yes
 # Object detection with an RT-DETRv2 checkpoint.
 mlxcel detect -m models/rt-detr-v2 -i image.jpg --format json
 
+# Text-to-image and image editing with a Diffusers-style checkpoint (no model
+# family is registered yet; see docs/image-generation.md).
+mlxcel generate-image -m models/flux2-klein -p "a watercolor fox" -o fox.png
+
 # Inspect the hardware-specific kernel tuning matrix without profiling it.
 mlxcel tune --dry-run
 
@@ -350,6 +355,7 @@ Install with `pip install ./python`. See [Python client](docs/python-client.md) 
 - [Tensor and pipeline parallelism](docs/distributed.md)
 - [OpenAI Responses API](docs/responses-api.md)
 - [Embeddings and reranking](docs/embeddings.md)
+- [Image generation](docs/image-generation.md)
 - [Audio API](docs/audio-api.md)
 - [Nemotron VoiceChat (full-duplex speech)](docs/nemotron-voicechat.md)
 - [TurboQuant KV cache](docs/turbo-kv-cache.md)

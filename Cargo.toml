@@ -29,7 +29,7 @@ resolver = "2"
 
 [package]
 name = "mlxcel"
-version = "0.7.0"
+version = "0.8.0-beta.1"
 edition = "2024"
 description = "High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs"
 repository = "https://github.com/lablup/mlxcel"
@@ -327,6 +327,18 @@ opt-level = 3             # Maximum speed optimization (inference is compute-bou
 # crashes cleanly for a supervised restart rather than silently unwinding.
 panic = "unwind"
 
+# Do not strip proc-macro dylibs and build scripts. Build dependencies
+# otherwise inherit `strip = true` above (rustc gets `-C strip=symbols`). On
+# macOS 27 / Xcode 27 with MACOSX_DEPLOYMENT_TARGET at 12.0 or later
+# (release.yml sets 14.0), dyld refuses to load the stripped proc-macro dylib
+# and rustc reports `E0463: can't find crate` for `futures_macro`,
+# `tracing_attributes` and the like. Rust 1.99 does not hit it, but the
+# toolchain is pinned to 1.97.1. This override only touches host build
+# dependencies; the shipped binaries keep `strip = true`. `test-fast`
+# inherits it.
+[profile.release.build-override]
+strip = false
+
 # Fast profile for local/agent edit-test iteration (issue #809).
 #
 # [profile.release] above is tuned for shipping binaries: fat LTO across all
@@ -487,6 +499,11 @@ required-features = ["xla-diagnostics-cpu"]
 name = "xla_youtu_vl_reference_check"
 required-features = ["xla-diagnostics-cpu"]
 
+# Real-runtime acceptance probe for the generic auxiliary ABI: compiles a tiny
+# StableHLO module through `iree-compile`, runs it on the given device (default
+# `local-task`), prints its float / integer / bool outputs, and reports that the
+# shim rejects wrong output counts, types, shapes and config identities. Needs
+# real IREE execution, so it builds only under `xla-iree`.
 [[example]]
 name = "xla_aux_smoke"
 required-features = ["xla-iree"]

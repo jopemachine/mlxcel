@@ -380,6 +380,14 @@ pub trait LanguageModel {
 
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases.
+    ///
+    /// Only an embedding (VLM) prefill runs it, and only after that
+    /// prefill's logits are evaluated, so an override may replace weight
+    /// arrays the prefill graph referenced (#2177). No family overrides it at
+    /// this commit; `LoadedModel`, `VisionModel` and the `&M` blanket impl
+    /// delegate to the wrapped model.
+    ///
+    /// Used by: `Engine::prefill`, its only caller.
     fn after_prefill(&self) {}
 
     /// Drop the trailing `excess` pad positions a padded prefill piece wrote
@@ -1309,6 +1317,12 @@ pub struct TtftPhases {
     pub eval_ns: u128,
     /// Fixed post-eval work before the decode loop starts.
     pub post_ns: u128,
+    /// Checkpoint tensors the `eval` phase had to read and upload, with the
+    /// host staging and copy back-pressure legs split (#1564). `None` on a
+    /// build without the CUDA upload counters. Under the default eager
+    /// weight materialization this reads `weights=0` on a text-only first
+    /// token; a nonzero count is weight I/O charged to the first token.
+    pub weights: Option<crate::weight_materialize::WeightTransferStats>,
 }
 
 impl TtftPhases {
@@ -1337,7 +1351,7 @@ impl TtftPhases {
     #[must_use]
     pub fn format_line(&self, prompt_tokens: usize, prefill_ns: u128) -> String {
         let ms = |ns: u128| ns as f64 / 1e6;
-        format!(
+        let mut line = format!(
             "[TTFT] prompt={prompt_tokens} tok setup={:.2}ms build={:.2}ms sample={:.2}ms eval={:.2}ms post={:.2}ms | prefill={:.2}ms residual={:.2}ms",
             ms(self.setup_ns),
             ms(self.build_ns),
@@ -1346,7 +1360,12 @@ impl TtftPhases {
             ms(self.post_ns),
             ms(prefill_ns),
             ms(prefill_ns.saturating_sub(self.in_prefill_ns())),
-        )
+        );
+        if let Some(weights) = &self.weights {
+            line.push_str(" | eval ");
+            line.push_str(&weights.format_fields());
+        }
+        line
     }
 }
 

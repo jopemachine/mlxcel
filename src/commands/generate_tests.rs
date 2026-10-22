@@ -942,7 +942,10 @@ fn cli_pipeline_requested_is_disabled_by_default() {
 }
 
 #[test]
-fn validate_pipeline_parallel_args_requires_two_stages_without_manual_ranges() {
+fn validate_pipeline_parallel_args_accepts_single_stage_and_manual_ranges() {
+    // `--pp-size` 1 or 0 without `--pp-layers` leaves PP off and hits the early
+    // return. A non-empty `--pp-layers` spec with `--pp-size 1` and TP off is
+    // accepted too.
     let mut args = sample_generate_args(temp_model_dir("pp-too-small"));
     args.pipeline_parallel.pp_size = 1;
 
@@ -977,6 +980,34 @@ fn validate_pipeline_parallel_args_rejects_incompatible_modes() {
 }
 
 #[test]
+fn validate_pipeline_parallel_args_rejects_zero_micro_batch_empty_layers_and_media() {
+    let mut args = sample_generate_args(temp_model_dir("pp-other-checks"));
+    args.pipeline_parallel.pp_size = 2;
+
+    args.pipeline_parallel.pp_micro_batch_size = 0;
+    let err = validate_pipeline_parallel_args(&args)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--pp-micro-batch-size"), "got: {err}");
+    args.pipeline_parallel.pp_micro_batch_size = 1;
+
+    args.pipeline_parallel.pp_layers = Some("  ".to_string());
+    let err = validate_pipeline_parallel_args(&args)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--pp-layers must not be empty"), "got: {err}");
+    args.pipeline_parallel.pp_layers = None;
+
+    args.generation.image = vec![PathBuf::from("a.png")];
+    let err = validate_pipeline_parallel_args(&args)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("text-only"), "got: {err}");
+
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
 fn validate_pipeline_parallel_args_accepts_adapter() {
     // LoRA + PP composition is supported: stage-local adapter loading is
     // wired through load_in_process_stage_worker_with_adapter. The CLI
@@ -1004,14 +1035,28 @@ fn validate_pipeline_parallel_args_accepts_2d_pp_tp() {
 }
 
 #[test]
-fn validate_pipeline_parallel_args_rejects_2d_without_pp_enabled() {
-    // TP > 1 with pp_size=1 is TP-only, not 2D; but if the caller sets pp_size=0
-    // alongside tp_size=2 it is malformed. The validator returns early when
-    // PP is disabled, so this case is harmless — verify it doesn't error.
+fn validate_pipeline_parallel_args_accepts_tp_only_when_pp_disabled() {
+    // TP-only (`--tp-size 2` with the default `--pp-size 1`) is a supported
+    // path. The validator returns early when PP is disabled, so it accepts it.
     let mut args = sample_generate_args(temp_model_dir("tp-only"));
     args.pipeline_parallel.pp_size = 1;
     args.tensor_parallel.tp_size = 2;
     assert!(validate_pipeline_parallel_args(&args).is_ok());
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_args_rejects_zero_pp_size_with_layers_and_tp() {
+    // `--pp-size 0 --pp-layers 0-3,4-7 --tp-size 2` gets past the early return
+    // (an explicit layer spec is present) but names an empty rank grid.
+    let mut args = sample_generate_args(temp_model_dir("pp0-layers-tp"));
+    args.pipeline_parallel.pp_size = 0;
+    args.pipeline_parallel.pp_layers = Some("0-3,4-7".to_string());
+    args.tensor_parallel.tp_size = 2;
+    let err = validate_pipeline_parallel_args(&args)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("inconsistent 2D topology"), "got: {err}");
     fs::remove_dir_all(args.model.model).unwrap();
 }
 

@@ -9,6 +9,11 @@
 //   final fallback.
 // - A one-time notice when CUDA kernels are JIT-compiled on a cold cache, so
 //   the slower first response is not a mystery (suppress with MLXCEL_QUIET_JIT).
+// - Custom kernels (mx.fast.cuda_kernel) are written to the disk cache like the
+//   built-in ones, and cache files are published by rename so a concurrent
+//   reader never loads a partial file (issue #2492). The cache heals itself:
+//   an empty or unparseable entry is a miss, and an entry that fails to load
+//   is discarded, recompiled and republished once.
 
 #include "mlx/backend/cuda/jit_module.h"
 #include "mlx/backend/cuda/device.h"
@@ -16,12 +21,20 @@
 
 #include "cuda_jit_sources.h"
 
+#include <chrono>
 #include <mutex>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <shared_mutex>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <fmt/format.h>
 #include <nvrtc.h>
@@ -233,16 +246,35 @@ bool read_cached_ptx(
   if (!ptx_file.good()) {
     return false;
   }
+  // [mlxcel #2492] An entry that cannot be trusted is a miss, so the caller
+  // recompiles and republishes it. Upstream accepted an empty .ptx or an empty
+  // kernel map, which fails at load time on every launch; with custom kernels
+  // now cached, that would break decode permanently.
+  if (ptx_size == 0) {
+    return false;
+  }
   ptx.resize(ptx_size);
   ptx_file.read(ptx.data(), ptx_size);
+  if (static_cast<std::uintmax_t>(ptx_file.gcount()) != ptx_size) {
+    ptx.clear();
+    return false;
+  }
 
   std::ifstream txt_file(ptx_path.replace_extension(".txt"), std::ios::binary);
   std::string line;
+  bool valid = true;
   while (std::getline(txt_file, line)) {
     auto tab = line.find('\t');
-    if (tab != std::string::npos) {
-      ptx_kernels.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+    if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) {
+      valid = false;
+      break;
     }
+    ptx_kernels.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+  }
+  if (!valid || ptx_kernels.empty()) {
+    ptx.clear();
+    ptx_kernels.clear();
+    return false;
   }
   return true;
 }
@@ -260,25 +292,81 @@ void write_cached_ptx(
 
   auto ptx_path = get_ptx_path(cache_dir, module_name);
 
-  // Ensure that the directory exists
+  // Ensure that the directory exists. A failure only leaves the cache cold.
   auto parent = ptx_path.parent_path();
   if (parent != cache_dir) {
-    std::filesystem::create_directories(parent);
+    std::error_code dir_error;
+    std::filesystem::create_directories(parent, dir_error);
+    if (dir_error) {
+      return;
+    }
   }
 
-  // Write the compiled code and mangled names
-  std::ofstream ptx_file(ptx_path, std::ios::binary);
-  if (!ptx.empty()) {
-    ptx_file.write(&ptx.front(), ptx.size());
-  }
-  std::ofstream txt_file(ptx_path.replace_extension(".txt"), std::ios::binary);
+  // [mlxcel #2492] Publish each file by writing a process-unique temporary and
+  // renaming it into place. Upstream wrote the final paths directly, so a
+  // second process (a parallel test binary, a server next to a CLI run) could
+  // read a truncated .ptx and fail in cuModuleLoadDataEx. The .txt kernel map
+  // is published before the .ptx, and the .ptx only when the map made it,
+  // because read_cached_ptx keys the hit on the .ptx: once it exists, its map
+  // is complete. Each temporary is closed before its state is checked, so a
+  // failed final flush (a full disk) is caught before the rename. A failed
+  // write or rename only leaves the cache cold, which the next process
+  // repairs by recompiling. Within a process get_jit_module serializes
+  // writers, so the process id plus a clock tick names the temporary.
+#if defined(_WIN32)
+  const auto process_id = static_cast<unsigned long long>(_getpid());
+#else
+  const auto process_id = static_cast<unsigned long long>(getpid());
+#endif
+  const auto unique_suffix = fmt::format(
+      ".tmp{:x}_{:x}",
+      process_id,
+      static_cast<unsigned long long>(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto publish = [&](const std::filesystem::path& path,
+                     const char* data,
+                     size_t size) -> bool {
+    auto tmp = path;
+    tmp += unique_suffix;
+    bool written = false;
+    {
+      std::ofstream file(tmp, std::ios::binary);
+      if (size > 0) {
+        file.write(data, size);
+      }
+      file.close();
+      written = !file.fail();
+    }
+    std::error_code error;
+    if (written) {
+      std::filesystem::rename(tmp, path, error);
+      if (!error) {
+        return true;
+      }
+    }
+    std::filesystem::remove(tmp, error);
+    return false;
+  };
+
+  // Write the mangled names, then the compiled code
+  std::string kernel_map;
   for (const auto& [name, mangled] : ptx_kernels) {
-    txt_file << name << "\t" << mangled << std::endl;
+    kernel_map += name;
+    kernel_map += '\t';
+    kernel_map += mangled;
+    kernel_map += '\n';
+  }
+  auto txt_path = ptx_path;
+  txt_path.replace_extension(".txt");
+  if (!publish(txt_path, kernel_map.data(), kernel_map.size()) ||
+      !publish(ptx_path, ptx.data(), ptx.size())) {
+    return;
   }
 
   // Write the generated code
-  std::ofstream source_file(ptx_path.replace_extension(".cu"));
-  source_file << source_code;
+  auto source_path = ptx_path;
+  source_path.replace_extension(".cu");
+  publish(source_path, source_code.data(), source_code.size());
 }
 
 // Return if |device|'s version is not newer than |major|.|minor| version.
@@ -470,8 +558,11 @@ JitModule::JitModule(
   std::string ptx;
   std::vector<std::pair<std::string, std::string>> ptx_kernels;
 
-  // Try to load them from the file cache
-  if (!read_cached_ptx(ptx_cache_dir(), module_name, ptx, ptx_kernels)) {
+  // Compile from source (or take the precompiled blob) and publish the result
+  // to the file cache.
+  auto compile_and_publish = [&]() {
+    ptx.clear();
+    ptx_kernels.clear();
     auto [precompiled, source_code, kernel_names] = builder();
 
     // Get the PTX or cubin
@@ -498,15 +589,59 @@ JitModule::JitModule(
       compile(device, module_name, source_code, kernel_names, ptx, ptx_kernels);
     }
 
-    // If requested save them in the file cache for the next launch
-    if (use_disk_cache) {
-      write_cached_ptx(
-          ptx_cache_dir(), module_name, ptx, ptx_kernels, source_code);
-    }
+    // Save them in the file cache for the next launch.
+    //
+    // [mlxcel #2492] Upstream skips the write when use_disk_cache is false,
+    // which only custom_kernel.cpp passes, so every mx.fast.cuda_kernel was
+    // NVRTC-compiled again in every process (the read above is attempted
+    // either way, it just never hit). mlxcel's fused decode kernels (MoE,
+    // SSM, ...) are custom kernels, and their first launch lands inside the
+    // first decode step: on GB10 the fused MoE pair alone added about 1.2 s
+    // to each `mlxcel generate`, which made granite-4.0-h decode at -n 256
+    // read 20% slower with the kernel than without it although the kernel
+    // is faster per token (docs/benchmark_results/
+    // fused-moe-jit-cache-gb10-2026-10-22.md). The module name already keys
+    // on the template-argument hash and on a hash of the full source
+    // (custom_kernel.cpp), so a hit can only return code compiled from the
+    // same source, which makes caching them as safe as caching the built-in
+    // kernels. The parameter stays for upstream signature parity.
+    (void)use_disk_cache;
+    write_cached_ptx(
+        ptx_cache_dir(), module_name, ptx, ptx_kernels, source_code);
+  };
+
+  // Try to load them from the file cache
+  const bool cache_hit =
+      read_cached_ptx(ptx_cache_dir(), module_name, ptx, ptx_kernels);
+  if (!cache_hit) {
+    compile_and_publish();
   }
 
   // Load the module
-  load_module(module_name, ptx, ptx_kernels, module_, kernels_);
+  if (!cache_hit) {
+    load_module(module_name, ptx, ptx_kernels, module_, kernels_);
+  } else {
+    // [mlxcel #2492] A cached entry that fails to load (a truncated or
+    // corrupt file, or code built for another device) is discarded and
+    // rebuilt once, so a bad entry cannot break the kernel permanently. A
+    // second failure takes the original error path.
+    try {
+      load_module(module_name, ptx, ptx_kernels, module_, kernels_);
+    } catch (const std::exception&) {
+      kernels_.clear();
+      // A failure in cuModuleGetFunction leaves the module loaded; unload it
+      // so the retry does not leak the first handle.
+      if (module_ != nullptr) {
+        cuModuleUnload(module_);
+        module_ = nullptr;
+      }
+      auto bad_path = get_ptx_path(ptx_cache_dir(), module_name);
+      std::error_code remove_error;
+      std::filesystem::remove(bad_path, remove_error);
+      compile_and_publish();
+      load_module(module_name, ptx, ptx_kernels, module_, kernels_);
+    }
+  }
 }
 
 JitModule::~JitModule() {

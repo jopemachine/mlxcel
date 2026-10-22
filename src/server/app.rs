@@ -308,6 +308,19 @@ pub(crate) fn route_inventory(config: &crate::server::ServerConfig) -> Vec<Route
             Method::POST,
             post(routes::create_embeddings),
         ),
+        // Image generation and editing (OpenAI /v1/images surface), served by the
+        // image worker when `--image-model` loaded one; a structured 501
+        // otherwise. JSON bodies only: multipart upload is not served.
+        reg(
+            "/v1/images/generations",
+            Method::POST,
+            post(routes::create_image_generation),
+        ),
+        reg(
+            "/v1/images/edits",
+            Method::POST,
+            post(routes::create_image_edit),
+        ),
         // Reranking (Cohere / Jina compatible surface), served by the rerank
         // worker when one is loaded; a structured 501 otherwise.
         reg("/v1/rerank", Method::POST, post(routes::create_rerank)),
@@ -323,6 +336,13 @@ pub(crate) fn route_inventory(config: &crate::server::ServerConfig) -> Vec<Route
             "/v1/responses/:id/cancel",
             Method::POST,
             post(routes::cancel_response),
+        ),
+        // Conversation compaction (issue #2397). A static segment, so it
+        // does not collide with the `:id` routes, which are GET/DELETE.
+        reg(
+            "/v1/responses/compact",
+            Method::POST,
+            post(routes::compact_response),
         ),
         // Anthropic Messages API (/v1/messages surface).
         reg(
@@ -403,6 +423,16 @@ pub(crate) fn route_inventory(config: &crate::server::ServerConfig) -> Vec<Route
         reg("/models", Method::GET, get(routes::list_models)),
         reg("/embedding", Method::POST, post(routes::native_embeddings)),
         reg("/embeddings", Method::POST, post(routes::native_embeddings)),
+        reg(
+            "/images/generations",
+            Method::POST,
+            post(routes::create_image_generation),
+        ),
+        reg(
+            "/images/edits",
+            Method::POST,
+            post(routes::create_image_edit),
+        ),
         reg("/rerank", Method::POST, post(routes::create_rerank)),
         reg("/reranking", Method::POST, post(routes::create_rerank)),
         reg("/responses", Method::POST, post(routes::create_response)),
@@ -415,6 +445,11 @@ pub(crate) fn route_inventory(config: &crate::server::ServerConfig) -> Vec<Route
             "/responses/:id/cancel",
             Method::POST,
             post(routes::cancel_response),
+        ),
+        reg(
+            "/responses/compact",
+            Method::POST,
+            post(routes::compact_response),
         ),
         reg("/messages", Method::POST, post(routes::anthropic_messages)),
         reg(

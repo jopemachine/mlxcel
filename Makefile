@@ -149,7 +149,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(clean|fmt|install)' | grep -v '^bench' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)Maintenance Targets:$(RESET)"
-	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '^(update|tree|outdated|verify-versions|verify-kernel-dtype-keys|verify-binary-assets|bump-version):' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '^(update|tree|outdated|verify-versions|verify-kernel-dtype-keys|verify-env-var-docs|verify-binary-assets|verify-windows-paths|bump-version):' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)Variables:$(RESET)"
 	@echo "  $(CYAN)MODEL$(RESET)    Path to model directory (default: ./models/default)"
@@ -165,6 +165,7 @@ help: ## Show this help message
 	@echo "  make test                            # Run all tests"
 	@echo "  make verify                          # macOS merge gate (fmt + clippy + test)"
 	@echo "  make verify-test-cuda                # Linux/NVIDIA merge gate (workspace, single threaded)"
+	@echo "  make verify-test-cuda-qmm-determinism # CUDA quantized-prefill determinism on a real checkpoint"
 	@echo "  make test-fast-cuda FILTER=server::chat_request  # Fast filtered test-fast-profile run"
 	@echo ""
 
@@ -793,6 +794,26 @@ verify-test-cuda: ## CUDA gate: cargo test --workspace --profile test-fast --fea
 	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=cuda, single threaded)...$(RESET)"
 	$(CARGO) test --workspace --profile test-fast --features cuda --no-fail-fast -- --test-threads=1
 
+# `verify-test-cuda-qmm-determinism` is the real-checkpoint half of
+# `tests/cuda_qmm_determinism.rs`, the bitwise temp-0 prefill + decode gate
+# for the quantized matmul kernels (#910). Its checkpoint was missing on every
+# host and a missing checkpoint was a silent return, so for as long as the test
+# existed it reported `ok` without running (#1558). The model test is
+# `#[ignore]` now, which means `verify-test-cuda` reports it as `ignored` (that
+# gate passes no `--include-ignored`); the checkpoint-free kernel tests in the
+# same file still run there. This target runs all of the file's tests,
+# ignored ones included, and sets MLXCEL_REQUIRE_MODELS=1, so a checkpoint that
+# resolves nowhere fails instead of skipping. It sets MLX_ENABLE_TF32=0 itself
+# because the `ctor` pin described above lives in the lib crates' `cfg(test)`
+# builds and is absent from integration test binaries like this one. On a host that
+# serializes GPU work behind `gpu-lock`, build with `--no-run` first and run
+# the test binary under the lock rather than this target (see the test file).
+.PHONY: verify-test-cuda-qmm-determinism
+verify-test-cuda-qmm-determinism: ## CUDA gate: bitwise-repeatable quantized prefill on a real 4-bit checkpoint, fails if the checkpoint is missing (issue #1558)
+	@echo "$(CYAN)[verify] cuda_qmm_determinism (real checkpoint required, single threaded)...$(RESET)"
+	MLXCEL_REQUIRE_MODELS=1 MLX_ENABLE_TF32=0 $(CARGO) test --profile test-fast --features cuda \
+		--test cuda_qmm_determinism -- --include-ignored --test-threads=1
+
 .PHONY: verify-test-rocm
 verify-test-rocm: ## ROCm gate (experimental): cargo test --workspace --profile test-fast --features rocm --no-fail-fast -- --test-threads=1 (issue #1809)
 	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=rocm, single threaded)...$(RESET)"
@@ -821,7 +842,7 @@ verify-rocm-smoke: ## ROCm smoke: build, link and generate on the GPU, asserting
 # "does a real forward pass still run on this device" answer even while the
 # suite is red.
 .PHONY: verify-rocm
-verify-rocm: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
+verify-rocm: verify-versions verify-kernel-dtype-keys verify-env-var-docs verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
 	@echo "$(GREEN)[verify-rocm] OK$(RESET)"
 
 # The gate for a shared gfx1151 host (issue #2244). Build everything the gate
@@ -854,6 +875,18 @@ verify-kernel-dtype-keys: ## Assert every CUDA and HIP JIT kernel launch keys it
 	@echo "$(CYAN)[verify] kernel dtype cache keys...$(RESET)"
 	@python3 scripts/ci/check_kernel_dtype_keys.py
 	@bash scripts/ci/check_kernel_dtype_keys_test.sh
+
+# Every MLXCEL_* string literal under src/**/*.rs must appear on
+# docs/environment-variables.md or carry a reasoned ALLOWLIST entry in the
+# script (issue #1140). tests/test_check_env_var_docs.py is its negative
+# coverage: synthetic trees with a new undocumented call site, a deleted row,
+# and stale allowlist entries, each of which must fail. That suite also runs in
+# `verify-python-tooling`; it is repeated here so this target is complete alone.
+.PHONY: verify-env-var-docs
+verify-env-var-docs: ## Assert every MLXCEL_* name in src is documented in docs/environment-variables.md or allowlisted (issue #1140)
+	@echo "$(CYAN)[verify] MLXCEL_* environment variable docs...$(RESET)"
+	@python3 scripts/ci/check_env_var_docs.py
+	@python3 -m unittest tests/test_check_env_var_docs.py
 
 # check_kernel_port_dispatch_test.sh is the negative coverage for the ROCm
 # wavefront rules (#2147): it marks a shuffle-based table any-wave, adds a
@@ -899,6 +932,12 @@ verify-binary-assets: ## Assert every tracked binary file is declared with a siz
 	@python3 scripts/ci/check_binary_assets.py
 	@bash scripts/ci/check_binary_assets_test.sh
 
+.PHONY: verify-windows-paths
+verify-windows-paths: ## Assert no tracked path is a Windows device name such as AUX (issue #2531)
+	@echo "$(CYAN)[verify] Windows device-name paths...$(RESET)"
+	@python3 scripts/ci/check_windows_reserved_paths.py
+	@bash scripts/ci/check_windows_reserved_paths_test.sh
+
 # Offline structural half of the llama-server b10621 compatibility gate
 # (issue #1443, epic #1431): validates the checked-in manifest under
 # compat/llama-server/b10621/ without network or the b10621 archive. The
@@ -927,11 +966,13 @@ verify-webui-bundle: ## Rebuild the bundled WebUI twice and compare it with chec
 	@$(WEBUI_BUNDLE_PY) scripts/webui/build_bundle.py --verify
 
 .PHONY: verify-webui-frontend
-verify-webui-frontend: ## Run WebUI lint, typecheck, theme-selector gate, unit tests, Chromium layout/accessibility gate, and multi-engine browser smoke (issue #1848)
+verify-webui-frontend: ## Run WebUI lint, typecheck, theme-selector, built-theme and agent-block gates, unit tests, Chromium layout/accessibility gate, and multi-engine browser smoke (issue #1848)
 	@echo "$(CYAN)[verify] WebUI frontend lint/type/unit/browser matrix...$(RESET)"
 	@pnpm --dir webui run typecheck
 	@pnpm --dir webui run lint
 	@pnpm --dir webui run check:theme-selectors
+	@pnpm --dir webui run check:themes
+	@pnpm --dir webui run check:agents
 	@pnpm --dir webui run unit
 	@pnpm --dir webui run browser
 	@pnpm --dir webui run browser:all
@@ -1039,7 +1080,7 @@ bump-version: ## Release: set every version-tracking crate to VERSION and sync C
 	@$(MAKE) --no-print-directory verify-versions
 
 .PHONY: verify
-verify: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
+verify: verify-versions verify-kernel-dtype-keys verify-env-var-docs verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
 	@echo "$(GREEN)[verify] OK: matches the nightly-verify GitHub Actions job$(RESET)"
 
 .PHONY: verify-clean

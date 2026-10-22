@@ -22,12 +22,13 @@ static binaries: platform GPU/runtime libraries are still required.
 
 Both binaries (`mlxcel` and `mlxcel-server`) build from the same root package, so
 one feature set applies to both. Pass them with `cargo build --features <a,b>`.
-Shipping builds enable only the platform backend flags; the rest are opt-in seams
-or test scaffolding.
+Shipping builds enable the defaults plus the platform backend flags; the rest are
+opt-in seams, diagnostics harnesses, or test scaffolding.
 
 | Feature | Default | Effect |
 |---------|---------|--------|
 | `surgery` | **on** | Axis A weight-load surgery. Exposes `--surgery <config.yaml>` and `MLXCEL_SURGERY` for `scale` / `add` / `prune` / `replace` / `interpolate` weight-space edits at load time, and pulls in the `mlxcel-surgery` crate. When no surgery config is supplied the load path is byte-for-byte identical to a build without the feature. |
+| `webui` | **on** | Bundled offline browser shell for the administrative WebUI (issue #1836). Embeds the committed `src/webui/assets/` bundle through `rust-embed` and `mime_guess`, so the binaries serve it with no Node step; see [WebUI bundling](webui/bundling.md). `--no-default-features` drops the assets and the embedding dependencies. |
 | `metal` | off | Apple Silicon Metal GPU backend (delegates to `mlxcel-core/metal`). Standard on macOS. |
 | `accelerate` | off | Apple Accelerate CPU BLAS backend (delegates to `mlxcel-core/accelerate`). Standard on macOS. |
 | `cuda` | off | NVIDIA CUDA GPU backend (delegates to `mlxcel-core/cuda`). Required on NVIDIA hosts; a plain build is CPU-only (see the footgun note below). |
@@ -35,16 +36,23 @@ or test scaffolding.
 | `experimental-backend` | off | Reserves the non-MLX compute-backend seam slot (issue #338). Ships no kernels and adds no runtime dispatch; it only compiles the plug-in boundary where a future non-MLX engine (e.g. FuriosaAI RNGD) would implement `ComputeBackend`. `select_backend()` still folds to MLX. |
 | `xla-backend` | off | OpenXLA / StableHLO backend seam (issue #449, [ADR 0004](adr/0004-compute-backend-session-seam-and-stablehlo-family.md)). Pulls in `mlxcel-xla` and compiles the `Backend::Xla` / `Session::Xla` arms and the `MLXCEL_BACKEND=xla` selector, but no native execution engine: the crate is pure-Rust stubs plus the StableHLO graph emitter, so CI builds it unchanged. |
 | `xla-iree` | off | `xla-backend` plus real IREE execution (`mlxcel-xla/iree`). Compiles a C shim against a prebuilt IREE runtime and drives the bundled prefill / decode_step graphs. Needs `IREE_DIST` (or the source-build vars below) at build time, so it is a local / opt-in build, not a CI or release default. |
+| `xla-reference-diagnostics` | off | `xla-iree` plus `mlxcel-xla/diagnostics` for device-neutral reference capture in native IREE diagnostics. Keeps the eager MLX side on its default CPU backend and qualifies IREE `local-task` without an IREE CUDA source or build tree. Gates the `xla_gemma3_reference_check` and `xla_molmo_reference_check` examples. |
+| `xla-diagnostics` | off | Test-only forwarding for Gemma3n intermediate oracle validation. Its pinned reference is the production CUDA runtime, so it enables `cuda` on top of `xla-diagnostics-cpu`. Gates the `xla_llava_reference_check` and `xla_vision_reference_check` examples. Not part of `xla-iree`; production bundles are unchanged. |
+| `xla-diagnostics-cpu` | off | `xla-iree` plus `mlxcel-xla/diagnostics`: the CPU-only companion for bounded host-reference checks on machines without a CUDA driver. Gates the `xla_qwen25_vl_window_check`, `xla_qwen3_vl_deepstack_check`, `xla_youtu_vl_reference_check`, `xla_gemma3n_audio_reference_check`, and `xla_gemma3n_sscp_conv_oracle` examples. Deliberately does not replace the qualified `xla-diagnostics` production-target gate. |
+| `xla-diagnostics-rocm` | off | `rocm` plus `xla-diagnostics-cpu`: the ROCm-backed companion for production AMD GPU intermediate oracle validation. |
+| `xla-micro-oracle` | off | `xla-iree` plus `mlxcel-xla/micro-oracle`: the CPU-capable bounded MLX/IREE operator-oracle harness. Gates the `xla_numeric_probe` example. CUDA-specific production probes may add `cuda`, but the shared report and comparison layer does not require it. |
 | `test-utils` | off | Test-only helpers. Required to build the `distributed_integration`, `pipeline_e2e`, and `paged_handoff_parity` integration tests (`cargo test --features test-utils`). Not needed for the binaries. |
+| `voicechat-mic` | off | Live microphone and speaker client for the Nemotron VoiceChat `/v1/realtime` endpoint (issue #1376). Compiles the `cpal` audio-device crate for `cargo run --example voicechat_microphone --features voicechat-mic` only, never for the library, the server, or CI; see [Nemotron VoiceChat](nemotron-voicechat.md). |
 
-`default = ["surgery"]`, so a plain `cargo build` enables surgery only. A real
-build always adds a platform backend on top, e.g. `--features metal,accelerate` on
-Apple Silicon or `--features cuda` on NVIDIA. Build with `--no-default-features`
-to drop the `mlxcel-surgery` crate entirely (CI parity tests against pre-surgery
-behavior, or constrained embedded targets):
+`default = ["surgery", "webui"]`, so a plain `cargo build` enables surgery and the
+bundled WebUI only. A real build always adds a platform backend on top, e.g.
+`--features metal,accelerate` on Apple Silicon or `--features cuda` on NVIDIA.
+Build with `--no-default-features` to drop the `mlxcel-surgery` crate and the
+embedded WebUI assets entirely (CI parity tests against pre-surgery behavior, or
+constrained embedded targets):
 
 ```bash
-# Metal + Accelerate, no surgery crate.
+# Metal + Accelerate, no surgery crate, no WebUI assets.
 cargo build --release --no-default-features --features metal,accelerate
 ```
 
@@ -346,10 +354,13 @@ available on the deployment host, not only the runtime libraries:
   package ships all of them.
 - An NVIDIA driver matching the CUDA toolkit must be present to run on the GPU.
 
-Compiled kernels are cached on disk (`MLX_PTX_CACHE_DIR`, default under the
-system temp dir), so only the first run of each kernel variant pays the NVRTC
-cost. Point `MLX_PTX_CACHE_DIR` at a persistent path to keep the cache across
-sessions.
+Compiled kernels are cached on disk (`MLX_PTX_CACHE_DIR`; `mlxcel` and
+`mlxcel-server` default it to `~/.cache/mlxcel/cuda-ptx/<mlx-commit>`, other
+binaries leave MLX's system temp dir default), so only the first run of each
+kernel variant pays the NVRTC cost. This includes the custom kernels behind
+mlxcel's fused decode paths (fused MoE, SSM), which upstream MLX recompiled in
+every process and which therefore used to add about a second to each
+`mlxcel generate` on GB10 (lablup/mlxcel#2492).
 
 ### C++ ISA baseline (`MLXCEL_CXX_MARCH`)
 
@@ -616,7 +627,7 @@ made that unnecessary; not re-measured since), gpt-oss-20b-MXFP4-Q4 about 8 tok/
 | `MLXCEL_CXX_MARCH` | C++ bridge `-march` value, build-time; `none` omits the flag | `native` |
 | `MLXCEL_CCCL_DIR` | Override for the bundled CCCL (libcu++) header dir used by the CUDA NVRTC JIT | bundled `<exe-dir>/../include/cccl`, then build-time fallback |
 | `MLXCEL_CUTLASS_DIR` | Override for the bundled CUTLASS/CuTe header dir used by the CUDA NVRTC JIT for quantized matmul kernels | bundled `<exe-dir>/../include`, then build-time fallback |
-| `MLX_PTX_CACHE_DIR` | On-disk cache for JIT-compiled CUDA kernels | system temp dir |
+| `MLX_PTX_CACHE_DIR` | On-disk cache for JIT-compiled CUDA kernels, custom kernels included | `~/.cache/mlxcel/cuda-ptx/<mlx-commit>` for `mlxcel` and `mlxcel-server`, otherwise the system temp dir |
 | `MLXCEL_QUIET_JIT` | Suppress the one-time "compiling CUDA kernels" notice on a cold first run | unset (notice shown) |
 | `MLXCEL_DEVICE` | Runtime device hint (`gpu`, `metal`, or `cpu`) | `gpu` |
 | `MLXCEL_WIRED_LIMIT` | Apple Silicon wired-memory ceiling, e.g. `64GB`; `0`/`none` disables it | `max` |
@@ -662,6 +673,11 @@ Contributors touching the video path should run `make verify-test-video`, which
 runs the ffmpeg-backed tests for real. They are `#[ignore]` in the normal suite,
 so a machine without ffmpeg reports them as ignored instead of silently passing
 (#1172).
+
+On an NVIDIA host, `make verify-test-cuda-qmm-determinism` runs the quantized
+prefill determinism test against a real 4-bit Llama-3.2-1B checkpoint. It is
+`#[ignore]` in `verify-test-cuda` and fails rather than skips when the
+checkpoint is missing (#1558).
 
 ## Verifying the build
 

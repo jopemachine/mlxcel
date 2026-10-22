@@ -410,6 +410,10 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         pp.pp_micro_batch_size > 0,
         "--pp-micro-batch-size must be greater than 0"
     );
+    // Pipeline parallelism is off: nothing to validate here. This includes
+    // TP-only runs (`--tp-size > 1` with the default `--pp-size 1`), which are
+    // a supported, shipped path and are dispatched on `tp_size` elsewhere.
+    // Past this point `pp_layers.is_some() || pp_size >= 2` always holds.
     if pp.pp_layers.is_none() && pp.pp_size <= 1 {
         return Ok(());
     }
@@ -424,19 +428,14 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
     // and does not write up the 2D composition yet.
     let tp_size = args.tensor_parallel.tp_size;
     if tp_size > 1 {
+        // Soft guard against an inconsistent topology. It is reachable only
+        // with `--pp-size 0` plus an explicit `--pp-layers` spec (which gets
+        // past the early return) alongside `--tp-size > 1`. The full
+        // `pp_size * tp_size == nodes` check is performed at the cluster-TOML
+        // validator layer for remote topologies; here we only guard the local
+        // single-process 2D case.
         ensure!(
-            pp.pp_size >= 2 || pp.pp_layers.is_some(),
-            "2D parallelism requires --pp-size >= 2 (or an explicit --pp-layers spec) \
-             alongside --tp-size > 1"
-        );
-        // Soft guard against obvious topology mistakes. A negative-like sanity
-        // check here surfaces a clear error instead of a cryptic routing or
-        // sharding failure later on. The full `pp_size * tp_size == nodes`
-        // check is performed at the cluster-TOML validator layer for remote
-        // topologies; here we only guard the local single-process 2D case.
-        let total_ranks = (pp.pp_size as u64).saturating_mul(tp_size as u64);
-        ensure!(
-            total_ranks > 0,
+            pp.pp_size > 0,
             "inconsistent 2D topology: pp_size={} tp_size={}",
             pp.pp_size,
             tp_size
@@ -460,11 +459,6 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         ensure!(
             !spec.trim().is_empty(),
             "--pp-layers must not be empty when provided"
-        );
-    } else {
-        ensure!(
-            pp.pp_size >= 2,
-            "--pp-size must be at least 2 to enable pipeline parallelism"
         );
     }
     Ok(())
@@ -1908,6 +1902,15 @@ pub(super) fn run_generation_mode(
         // (#1168).
         reject_dflash_drafter_offline(draft_model_path)?;
 
+        // A target the classic walk must refuse (#2495) fails here, before a
+        // full draft checkpoint is loaded for nothing. `generate` keeps the
+        // same gate as the authority (it also covers the draft).
+        if let Some(reason) = mlxcel::prompt_lookup_unsupported_reason(model) {
+            return Err(classic_speculative_refusal(
+                mlxcel::SpeculativeGenerateError::TargetUnsupported(reason),
+            ));
+        }
+
         println!("Loading draft model from {:?}...", draft_model_path);
         let (draft_model, _draft_tokenizer) = select_backend().load_model(draft_model_path)?;
         println!("Draft model loaded.");
@@ -1950,7 +1953,8 @@ pub(super) fn run_generation_mode(
                  kind-specific `{generator}` round loop on this target model. \
                  The runtime wiring lands in {tracker}. For now, omit \
                  `--draft-kind` to use the classic SpeculativeGenerator with \
-                 your `--draft-model` drafter.",
+                 your `--draft-model` drafter (it refuses targets whose state a cache \
+                 trim cannot roll back).",
                 kind = resolved_kind,
                 generator = match resolved_kind {
                     DrafterKind::Mtp => "MtpGenerator",
@@ -2011,14 +2015,20 @@ pub(super) fn run_generation_mode(
             mlxcel::SpeculativeGenerator::new(main_num_layers, draft_num_layers)
                 .with_token_bias(token_bias);
 
-        let result = spec_generator.generate(
-            model,
-            &draft_model,
-            prompt_tokens,
-            args.generation.max_tokens,
-            args.model.num_draft_tokens,
-            sampling_config,
-        );
+        // A refused pair (a model whose state a cache trim cannot roll back,
+        // #2495) stops here, before the acceptance summary below. The prompt-
+        // lookup and engine drafter paths apply the same rule, so plain
+        // generation is the alternative for such a model.
+        let result = spec_generator
+            .generate(
+                model,
+                &draft_model,
+                prompt_tokens,
+                args.generation.max_tokens,
+                args.model.num_draft_tokens,
+                sampling_config,
+            )
+            .map_err(classic_speculative_refusal)?;
 
         // The CLI installs no tracing subscriber, so the info-level acceptance
         // instrumentation inside `SpeculativeGenerator` never reaches a
@@ -2168,6 +2178,17 @@ fn should_route_offline_mtp(
     // still auto-resolve to the DFlash default and keep the classic
     // SpeculativeGenerator (the small-full-model-as-drafter workflow).
     resolved_kind == DrafterKind::Mtp
+}
+
+/// The error for a classic `--draft-model` run that the speculative gate
+/// refused (#2495): the library reason plus the CLI remedy. Shared by the
+/// early target check and the `generate` call so the text cannot drift.
+fn classic_speculative_refusal(err: mlxcel::SpeculativeGenerateError) -> anyhow::Error {
+    anyhow!(
+        "{err}. The classic --draft-model speculative path rolls a rejected draft back by \
+         trimming the external KV caches, which this model pair does not support; run \
+         without --draft-model to generate normally."
+    )
 }
 
 /// Reject a DFlash speculative drafter before the offline path tries to load
